@@ -54,12 +54,27 @@ class ProfileUpdate(BaseModel):
     username: str = Field(min_length=1, max_length=30)
 
 
-class TripCreate(BaseModel):
+TravelParty = Literal[
+    "unspecified", "solo", "couple", "friends", "family",
+    "family_with_children", "with_parents", "senior_couple", "other",
+]
+
+
+class TravelPreferenceFields(BaseModel):
+    """여행마다 저장하는 동행 구성, 여행 강도와 상대적인 경비 수준이다."""
+
+    travel_party: TravelParty = "unspecified"
+    travel_intensity: int = Field(default=3, ge=1, le=5, strict=True)
+    budget_level: int = Field(default=3, ge=1, le=5, strict=True)
+
+
+class TripCreate(TravelPreferenceFields):
     """새 여행을 만들 때 입력하는 기본 정보이다."""
 
     title: str = Field(min_length=1, max_length=100)
     destination: str | None = Field(default=None, max_length=100)
-    timezone: str = Field(default="Asia/Seoul", min_length=1, max_length=64)
+    # 화면에서는 입력받지 않는다. 생략하면 AI 초안의 여행지 시간대를 검증해 저장한다.
+    timezone: str | None = Field(default=None, min_length=1, max_length=64)
     start_date: date | None = None
     end_date: date | None = None
 
@@ -82,6 +97,17 @@ class TripUpdate(BaseModel):
     start_date: date | None = None
     end_date: date | None = None
     status: Literal["planning", "ongoing", "completed"] | None = None
+    travel_party: TravelParty | None = None
+    travel_intensity: int | None = Field(default=None, ge=1, le=5, strict=True)
+    budget_level: int | None = Field(default=None, ge=1, le=5, strict=True)
+
+    @model_validator(mode="after")
+    def validate_preferences(self):
+        """생략한 조건은 유지하되 DB의 필수 칼럼에 명시적으로 null을 넣지 못하게 한다."""
+        for field in ("travel_party", "travel_intensity", "budget_level"):
+            if field in self.model_fields_set and getattr(self, field) is None:
+                raise ValueError("여행 구성, 강도, 경비는 빈 값으로 변경할 수 없습니다.")
+        return self
 
 
 class TripDateRangeUpdate(BaseModel):

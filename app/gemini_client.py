@@ -2,18 +2,34 @@
 
 import os
 from collections.abc import Iterator
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from google import genai
 from google.genai import types
 
+from app.services.travel_preferences import travel_preferences_text
 
-def _schedule_summary(days: list[dict]) -> str:
-    """Gemini 프롬프트에 넣을 확정 일정의 짧은 요약문을 만든다."""
+
+def _schedule_summary(days: list[dict], timezone_name: str = "Asia/Seoul") -> str:
+    """여행지 현지 시각으로 확정 일정을 요약해 채팅도 같은 시계를 사용하게 한다."""
+    trip_timezone = ZoneInfo(timezone_name)
+
+    def local_start(item: dict) -> str:
+        """숙소 체크인처럼 아직 시간이 없는 항목은 미정으로 남긴다."""
+        value = item.get("start_at")
+        if not value:
+            return "시간 미정"
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=trip_timezone)
+        return parsed.astimezone(trip_timezone).strftime("%Y-%m-%d %H:%M")
+
     lines: list[str] = []
     for day in days:
         items = day.get("items", [])
         item_text = ", ".join(
-            f"{item.get('title')}({item.get('start_at') or '시간 미정'})"
+            f"{item.get('title')}({local_start(item)})"
             for item in items
         ) or "일정 없음"
         lines.append(
@@ -44,12 +60,22 @@ def _travel_generation_inputs(
 여행지: {trip.get('destination') or '미정'}
 시간대: {trip.get('timezone') or 'Asia/Seoul'}
 
+현재 저장된 여행 조건:
+{travel_preferences_text(trip)}
+
 현재 확정된 일정:
-{_schedule_summary(days)}
+{_schedule_summary(days, trip.get('timezone') or 'Asia/Seoul')}
 
 한국어로 친절하고 짧게 답하세요. 일정에 없는 사실, 실제 영업시간,
 실시간 교통시간을 지어내지 마세요. 사용자가 일정 추가를 요청하면
 현재는 사용자가 화면의 '일정 직접 추가'에서 확정할 수 있다고 안내하세요.
+현재 저장된 동행 구성·강도·경비에 맞춰 다음 추천을 작성하세요. 이전 대화에서
+다른 조건을 썼더라도 최신 저장값을 기준으로 설명하고, 기존 일정이 자동으로
+수정되었다고 말하지 마세요. 경비는 상대적인 선호 수준이며 실제 가격이나 예약
+가능 여부를 확인한 값이 아닙니다. 나이나 동행 구성만으로 취향을 단정하지 마세요.
+여행지로 지정한 도시 안에서 추천하고, 사용자가 요청하지 않은 근교 도시로 범위를
+늘리지 마세요. 숙소 미정은 지역 제한을 없애는 이유가 아닙니다. 도시 안이라는
+설명만으로 실제 장소·동선 검증이 완료되었다고 말하지 마세요.
 """.strip()
 
     # Gemini 역할 이름에 맞춰 DB 메시지 역할을 변환한다.

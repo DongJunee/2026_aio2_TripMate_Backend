@@ -1,6 +1,8 @@
 import logging
+from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
@@ -12,6 +14,8 @@ from app.google_maps_client import (
     GoogleMapsUnavailableError,
 )
 from app.services.itinerary_generation import generate_daily_itinerary_drafts
+from app.services.itinerary_routing import group_nearby_itinerary_places
+from app.services.destination_scope import resolve_destination_scope
 from app.schemas import (
     ItineraryItemCreate,
     ItineraryItemUpdate,
@@ -200,8 +204,35 @@ def _resolve_initial_itinerary_places(
             detail="AI 장소 일정을 만들려면 Google Maps API를 설정하세요.",
         ) from error
 
+    try:
+        destination_scope = resolve_destination_scope(maps, destination)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except GoogleMapsError as error:
+        LOGGER.warning("여행 도시 Google 조회 실패: %s", error)
+        raise HTTPException(
+            status_code=502,
+            detail="Google Places에서 여행 도시 범위를 확인하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+        ) from error
+
     resolved_rows: list[dict] = []
+    place_coordinates: dict[str, tuple[float, float]] = {}
+    # 도시 조회 1회 뒤, 같은 여행 생성 중 반복되는 장소 검색은 재사용한다.
+    # Google 장소 검색은 서로 다른 검색어 수만큼이며 숙소·출국 안내는 검색하지 않는다.
+    resolved_by_query: dict[str, dict] = {}
+    city_aliases_checked = False
     for draft in drafts:
+        row = dict(draft)
+        activity_only = row.pop("_activity_only", False)
+        if activity_only:
+            # 이 표시는 모델 원문이 아니라 일정 생성 서비스가 만든 숙소·휴식 행이다.
+            # 숙소가 아직 없으므로 가짜 장소 ID/좌표를 만들지 않고 시간 계획만 저장한다.
+            if row.get("item_type") not in {"hotel", "note"} or row.get("_place_query"):
+                raise HTTPException(status_code=502, detail="숙소·휴식 일정 형식이 올바르지 않습니다.")
+            row.pop("_place_query", None)
+            resolved_rows.append(row)
+            continue
+
         place_query = str(draft.get("_place_query") or "").strip()
         if not place_query:
             # 이 값은 일정 생성 서비스의 내부 계약이므로, 없으면 모델 결과가 잘못된
@@ -211,37 +242,78 @@ def _resolve_initial_itinerary_places(
                 detail="AI가 Google 장소 검색어를 올바르게 만들지 못했습니다. 다시 시도해 주세요.",
             )
         full_query = " ".join((place_query, destination))
+        query_key = full_query.casefold()
+        if query_key in resolved_by_query:
+            row.pop("_place_query", None)
+            row.update(resolved_by_query[query_key])
+            resolved_rows.append(row)
+            continue
         try:
             candidates = maps.search_places(
                 full_query,
                 max_results=5,
                 language_code="ko",
+                location_restriction=destination_scope.viewport,
+                include_region_metadata=True,
             )
         except GoogleMapsError as error:
-            LOGGER.warning("AI 일정 Google 장소 검색 실패 (%s).", type(error).__name__)
+            # LOGGER.warning("AI 일정 Google 장소 검색 실패 (%s).", type(error).__name__)
+            LOGGER.warning("AI 일정 Google 장소 검색 실패: %s", error)
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail="Google Places에서 AI 일정 장소를 찾지 못했습니다. 잠시 후 다시 시도해 주세요.",
             ) from error
 
-        # 지도와 Routes가 바로 사용할 수 있도록 실제 장소 ID·좌표가 모두 있는
-        # 첫 번째 Google 결과만 쓴다. 없으면 임의 텍스트 일정으로 대체하지 않는다.
-        place = next((item for item in candidates if item.coordinates is not None), None)
+        # Google에 검색 범위를 지정해도 응답을 다시 검사한다. 같은 도에 있어도
+        # 다른 도시이거나, 도시 주소 정보가 없으면 후보를 저장하지 않는다.
+        place = next((item for item in candidates if destination_scope.accepts(item)), None)
+        if place is None and not city_aliases_checked and any(
+            destination_scope.rejection_reason(item) in {"city_name_mismatch", "administrative_name_mismatch"}
+            for item in candidates
+        ):
+            # 후쿠오카 도시 응답은 '후쿠오카시', 장소 주소는 'Fukuoka'처럼 언어가
+            # 달라질 수 있다. 요청당 한 번 같은 도시 ID의 영문 주소만 보완한다.
+            # 후보의 이름을 무조건 별칭으로 추가하거나 지역 검사를 해제하지 않는다.
+            city_aliases_checked = True
+            try:
+                city_aliases = maps.get_city_details(destination_scope.google_place_id, language_code="en")
+                destination_scope = destination_scope.with_city_aliases(city_aliases)
+            except (GoogleMapsError, ValueError) as error:
+                LOGGER.warning("여행 도시의 언어별 주소 확인 실패 (%s).", type(error).__name__)
+                raise HTTPException(
+                    status_code=502,
+                    detail="Google에서 같은 도시의 언어별 주소를 확인하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                ) from error
+            place = next((item for item in candidates if destination_scope.accepts(item)), None)
         if place is None:
+            # 인증값·사용자 질문·전체 응답은 기록하지 않고 실패 원인별 개수만 남긴다.
+            rejected = Counter(destination_scope.rejection_reason(item) for item in candidates)
+            LOGGER.warning("AI 일정 장소 지역 검증 실패: 후보 %d개, 사유 %s", len(candidates), dict(rejected))
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="AI가 제안한 장소를 Google Places에서 찾지 못했습니다. 여행지를 바꾸거나 다시 시도해 주세요.",
+                detail=(
+                    "AI가 제안한 장소 중 여행 도시 안에 있다고 확인된 후보가 없습니다. "
+                    "다른 도시의 장소로 대체하지 않았습니다. 다시 시도해 주세요."
+                ) if candidates else "Google 장소 검색 결과가 없습니다. 도시와 국가를 함께 입력하거나 다시 시도해 주세요.",
             )
 
         cached_place = _cache_google_place(client, place.as_place_row())
-        row = dict(draft)
+        if place.coordinates is not None:
+            place_coordinates[str(cached_place["id"])] = (
+                place.coordinates.latitude, place.coordinates.longitude,
+            )
         row.pop("_place_query", None)
         row["place_id"] = cached_place["id"]
         row["title"] = place.display_name[:150]
         row["source"] = "ai_recommendation"
+        resolved_by_query[query_key] = {
+            key: row[key] for key in ("place_id", "title", "source")
+        }
         resolved_rows.append(row)
 
-    return resolved_rows
+    # 실제 Google 좌표가 모두 모인 뒤, DB 저장 전에 날짜 간 군집과 방문 순서를
+    # 개선한다. 좌표는 메모리에서만 사용하며 일정 테이블에 임시 컬럼을 보내지 않는다.
+    return group_nearby_itinerary_places(resolved_rows, place_coordinates)
 
 
 def _remove_incomplete_trip(client, trip_id: UUID | str, user_id: str) -> None:
@@ -327,11 +399,15 @@ def trip_dashboard(client, trip_id: UUID | str) -> dict:
     return {"trip": trip, "days": days}
 
 
-def _shift_datetime(value: str, day_delta: timedelta) -> str:
-    """시각은 유지한 채 ISO 날짜·시간 값을 여행 일수만큼 이동한다."""
+def _shift_datetime(value: str, day_delta: timedelta, timezone_name: str) -> str:
+    """여행지 벽시계 시각을 유지하며 날짜를 옮기고 서머타임도 다시 적용한다."""
 
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    return (parsed + day_delta).isoformat()
+    trip_timezone = ZoneInfo(timezone_name)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=trip_timezone)
+    local_time = parsed.astimezone(trip_timezone)
+    return (local_time + day_delta).isoformat()
 
 
 def _sync_trip_days_for_dates(
@@ -339,6 +415,7 @@ def _sync_trip_days_for_dates(
     trip_id: UUID | str,
     start_date: date,
     end_date: date,
+    timezone_name: str,
 ) -> None:
     """등록된 일정을 보존하면서 trip_days를 변경된 여행 기간에 맞춘다.
 
@@ -346,6 +423,15 @@ def _sync_trip_days_for_dates(
     일수만큼 옮기고, 종료일을 늘리면 빈 DAY 행을 추가한다. 일정이 이미 있는
     DAY를 포함하도록 기간을 줄이는 일은 허용하지 않는다.
     """
+
+    # 날짜 행을 수정하기 전에 시간대가 유효한지 먼저 확인한다.
+    try:
+        ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError) as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="여행지 시간대 정보를 확인할 수 없어 날짜를 변경하지 못했습니다.",
+        ) from error
 
     # 행을 바꾸기 전에 현재 일정 전체를 읽어, 기존 일정 항목이 사라지게 되는
     # 기간 축소 요청을 거부할 수 있게 한다.
@@ -403,7 +489,7 @@ def _sync_trip_days_for_dates(
         day_delta = new_date - old_date
         for item in items_by_day.get(day["id"], []):
             changed_times = {
-                field: _shift_datetime(item[field], day_delta)
+                field: _shift_datetime(item[field], day_delta, timezone_name)
                 for field in ("start_at", "end_at")
                 if item.get(field)
             }
@@ -462,17 +548,21 @@ def create_my_trip(
     # Gemini와 Google Places 조회는 trips 행을 만들기 전에 끝낸다. 따라서 둘 중
     # 하나라도 실패하면 사용자의 여행 목록에는 새 여행이 전혀 생기지 않는다.
     try:
-        drafts = generate_daily_itinerary_drafts(trip_values, days)
+        generated = generate_daily_itinerary_drafts(trip_values, days)
     except ValueError as error:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="AI 일정 초안을 만들지 못했습니다. 다시 시도해 주세요.",
         ) from error
+    drafts = generated.items
     if not drafts:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="AI 일정 초안이 비어 있어 여행을 만들지 못했습니다. 다시 시도해 주세요.",
         )
+    # 일정 시각에 적용한 것과 같은 시간대를 저장해 UTC 조회 결과를 화면에서
+    # 여행지 현지 시각으로 되돌릴 수 있게 한다. 서버의 로컬 시간은 사용하지 않는다.
+    trip_values["timezone"] = generated.timezone
     resolved_drafts = _resolve_initial_itinerary_places(client, trip_values, drafts)
 
     # Google 결과까지 모두 준비된 뒤에만 사용자 소유 여행을 만들고, 같은 서버가
@@ -613,12 +703,13 @@ def update_trip_dates(
 
     client = get_user_client(current_user.token)
     # 아래의 여러 테이블 동기화를 수행하기 전에 접근 권한을 확인한다.
-    _owned_trip(client, trip_id)
+    trip = _owned_trip(client, trip_id)
     _sync_trip_days_for_dates(
         client,
         trip_id,
         payload.start_date,
         payload.end_date,
+        trip["timezone"],
     )
     result = (
         client.table("trips")

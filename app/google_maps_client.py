@@ -48,6 +48,14 @@ PLACE_DETAILS_FIELD_MASK = ",".join(
         "googleMapsUri",
     )
 )
+# 도시 조회에서는 평점·리뷰를 요청하지 않는다. 검색 사각형과 구조화된 행정구역을
+# 함께 사용하며, viewport 자체를 정확한 도시 경계 다각형이라고 간주하지 않는다.
+CITY_SEARCH_FIELD_MASK = ",".join(
+    f"places.{field}" for field in (
+        "id", "displayName", "formattedAddress", "location", "types",
+        "addressComponents", "viewport",
+    )
+)
 ROUTE_FIELD_MASK = "routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline"
 
 RouteTravelMode = Literal["walk", "transit", "drive", "bicycle"]
@@ -98,6 +106,43 @@ class Coordinates:
 
 
 @dataclass(frozen=True)
+class GeoViewport:
+    """Google 검색에 쓸 사각 범위이다. 행정구역 경계 다각형은 아니다."""
+
+    low: Coordinates
+    high: Coordinates
+
+    def __post_init__(self) -> None:
+        """빈 위도 범위와 날짜변경선의 빈 경도 범위를 거절한다."""
+        if self.low.latitude > self.high.latitude:
+            raise ValueError("검색 범위의 남쪽은 북쪽보다 높을 수 없습니다.")
+        if self.low.longitude == 180 and self.high.longitude == -180:
+            raise ValueError("검색 범위의 경도가 비어 있습니다.")
+
+    def contains(self, coordinates: Coordinates) -> bool:
+        """경계점과 날짜변경선을 가로지르는 검색 사각형을 함께 처리한다."""
+        if not self.low.latitude <= coordinates.latitude <= self.high.latitude:
+            return False
+        west, east = self.low.longitude, self.high.longitude
+        if west > east:
+            return coordinates.longitude >= west or coordinates.longitude <= east
+        return west <= coordinates.longitude <= east
+
+    def as_google_rectangle(self) -> dict[str, dict[str, float]]:
+        """Text Search의 locationRestriction.rectangle 요청 값이다."""
+        return {"low": self.low.as_google_lat_lng(), "high": self.high.as_google_lat_lng()}
+
+
+@dataclass(frozen=True)
+class AddressComponent:
+    """주소 문자열의 부분 일치 대신 비교할 Google의 행정구역 구성요소이다."""
+
+    long_text: str
+    short_text: str
+    types: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class PlaceResult:
     """데이터베이스에 저장하기 알맞게 추린 Places API(New) 장소 응답 일부이다."""
 
@@ -110,6 +155,8 @@ class PlaceResult:
     primary_type: str | None
     types: tuple[str, ...]
     google_maps_uri: str | None
+    address_components: tuple[AddressComponent, ...] = ()
+    viewport: GeoViewport | None = None
 
     @classmethod
     def from_google_payload(cls, payload: dict[str, Any]) -> "PlaceResult":
@@ -136,6 +183,28 @@ class PlaceResult:
 
         rating = payload.get("rating")
         rating_count = payload.get("userRatingCount")
+        address_components = []
+        raw_components = payload.get("addressComponents") or []
+        if not isinstance(raw_components, list):
+            raise GoogleMapsRequestError("Google 장소의 행정구역 형식이 올바르지 않습니다.")
+        for component in raw_components:
+            if not isinstance(component, dict) or not isinstance(component.get("types", []), list):
+                raise GoogleMapsRequestError("Google 장소의 행정구역 형식이 올바르지 않습니다.")
+            address_components.append(AddressComponent(
+                long_text=str(component.get("longText") or "").strip(),
+                short_text=str(component.get("shortText") or "").strip(),
+                types=tuple(str(value) for value in component.get("types", [])),
+            ))
+        viewport = None
+        if payload.get("viewport") is not None:
+            try:
+                raw_viewport = payload["viewport"]
+                viewport = GeoViewport(
+                    low=Coordinates(float(raw_viewport["low"]["latitude"]), float(raw_viewport["low"]["longitude"])),
+                    high=Coordinates(float(raw_viewport["high"]["latitude"]), float(raw_viewport["high"]["longitude"])),
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise GoogleMapsRequestError("Google 장소의 검색 범위 형식이 올바르지 않습니다.") from error
         try:
             return cls(
                 google_place_id=place_id,
@@ -147,6 +216,8 @@ class PlaceResult:
                 primary_type=_optional_text(payload.get("primaryType")),
                 types=tuple(str(item) for item in payload.get("types") or ()),
                 google_maps_uri=_optional_text(payload.get("googleMapsUri")),
+                address_components=tuple(address_components),
+                viewport=viewport,
             )
         except (TypeError, ValueError) as error:
             raise GoogleMapsRequestError(
@@ -270,6 +341,8 @@ class GoogleMapsClient:
         radius_meters: float = 5_000,
         max_results: int = 10,
         language_code: str = "ko",
+        location_restriction: GeoViewport | None = None,
+        include_region_metadata: bool = False,
     ) -> list[PlaceResult]:
         """Places API(New) 텍스트 검색으로 장소 카드를 찾는다.
 
@@ -287,6 +360,8 @@ class GoogleMapsClient:
             raise ValueError("검색 결과 수는 1에서 20 사이여야 합니다.")
         if location_bias is not None and not 1 <= radius_meters <= 50_000:
             raise ValueError("검색 반경은 1에서 50000m 사이여야 합니다.")
+        if location_bias is not None and location_restriction is not None:
+            raise ValueError("검색 우선 위치와 검색 제한 범위는 동시에 지정할 수 없습니다.")
 
         payload: dict[str, Any] = {
             "textQuery": cleaned_query,
@@ -300,18 +375,44 @@ class GoogleMapsClient:
                     "radius": radius_meters,
                 }
             }
+        if location_restriction is not None:
+            payload["locationRestriction"] = {"rectangle": location_restriction.as_google_rectangle()}
+
+        field_mask = PLACE_SEARCH_FIELD_MASK
+        if include_region_metadata:
+            field_mask += ",places.addressComponents"
 
         response = self._request_json(
             PLACES_TEXT_SEARCH_URL,
             method="POST",
             payload=payload,
-            field_mask=PLACE_SEARCH_FIELD_MASK,
+            field_mask=field_mask,
         )
         places = response.get("places") or []
         if not isinstance(places, list):
             raise GoogleMapsRequestError("Google Places 응답의 장소 목록 형식이 올바르지 않습니다.")
         if not all(isinstance(place, dict) for place in places):
             raise GoogleMapsRequestError("Google Places 응답의 장소 목록 형식이 올바르지 않습니다.")
+        return [PlaceResult.from_google_payload(place) for place in places]
+
+    def search_city(self, destination: str, *, language_code: str = "ko") -> list[PlaceResult]:
+        """여행당 한 번 도시 자체를 조회한다. 숙소·새 API 키·Geocoding API는 필요 없다.
+
+        지정 유형 필터는 지리 검색에 적용되지 않을 수 있으므로 실제 응답의 유형을
+        도시 검증 서비스에서 확인한다. 결과를 넓은 도/국가로 자동 대체하지 않는다.
+        """
+        query = destination.strip()
+        if not query or len(query) > 100:
+            raise ValueError("여행할 도시를 1~100자로 입력하세요.")
+        response = self._request_json(
+            PLACES_TEXT_SEARCH_URL,
+            method="POST",
+            payload={"textQuery": query, "pageSize": 5, "languageCode": language_code},
+            field_mask=CITY_SEARCH_FIELD_MASK,
+        )
+        places = response.get("places") or []
+        if not isinstance(places, list) or not all(isinstance(place, dict) for place in places):
+            raise GoogleMapsRequestError("Google 도시 검색 결과의 형식이 올바르지 않습니다.")
         return [PlaceResult.from_google_payload(place) for place in places]
 
     def get_place_details(
@@ -330,6 +431,22 @@ class GoogleMapsClient:
             f"{PLACES_DETAILS_URL}/{quote(place_id, safe='')}?{query}",
             method="GET",
             field_mask=PLACE_DETAILS_FIELD_MASK,
+        )
+        return PlaceResult.from_google_payload(response)
+
+    def get_city_details(self, google_place_id: str, *, language_code: str = "en") -> PlaceResult:
+        """동일 도시 ID의 다른 언어 주소를 확인한다. 평점·리뷰는 요청하지 않는다.
+
+        도시 검색과 장소 검색에 같은 languageCode를 써도 주소 구성요소의 언어가
+        다를 수 있다. 번역 문자열을 추측하지 않고 동일 ID의 Google 응답을 사용한다.
+        """
+        place_id = google_place_id.removeprefix("places/").strip()
+        if not place_id or "/" in place_id:
+            raise ValueError("유효한 Google 도시 ID를 입력하세요.")
+        response = self._request_json(
+            f"{PLACES_DETAILS_URL}/{quote(place_id, safe='')}?{urlencode({'languageCode': language_code})}",
+            method="GET",
+            field_mask=CITY_SEARCH_FIELD_MASK.replace("places.", ""),
         )
         return PlaceResult.from_google_payload(response)
 
