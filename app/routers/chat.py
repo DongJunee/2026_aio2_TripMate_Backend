@@ -1,18 +1,20 @@
 import json
+import logging
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.cache import cache_delete, cache_get, cache_set
 from app.db import get_user_client
 from app.deps import CurrentUser, get_current_user, require_own_trip
-from app.gemini_client import generate_travel_reply_stream
-from app.routers.trips import touch_trip, trip_dashboard
+from app.gemini_client import generate_travel_reply_stream, resolve_itinerary_place_swap_request
+from app.routers.trips import apply_ai_place_swap, touch_trip, trip_dashboard
 from app.schemas import ChatRequest
 
 router = APIRouter(tags=["chat"])
 MESSAGES_CACHE_TTL_SECONDS = 300
+LOGGER = logging.getLogger(__name__)
 
 
 def _cache_key(trip_id: UUID | str) -> str:
@@ -115,6 +117,37 @@ def _stream_answer(
     )
 
 
+def _stream_fixed_answer(
+    client,
+    trip_id: UUID,
+    text: str,
+) -> StreamingResponse:
+    """서버가 실제 일정 작업을 끝낸 뒤 짧은 확인 답변을 저장·전송한다."""
+
+    def event_stream():
+        """변경 완료 문구와 저장 완료 이벤트를 SSE 순서로 만든다."""
+
+        try:
+            saved = (
+                client.table("messages")
+                .insert({"trip_id": str(trip_id), "role": "assistant", "content": text})
+                .execute()
+            )
+            cache_delete(_cache_key(trip_id))
+        except Exception as error:
+            yield _sse_event({"error": f"AI 답변을 저장하지 못했습니다. {error}"})
+            return
+        yield _sse_event({"text": text})
+        saved_id = saved.data[0]["id"] if saved.data else None
+        yield _sse_event({"done": True, "message_id": saved_id})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @router.get("/trips/{trip_id}/messages")
 def list_messages(
     trip_id: UUID = Depends(require_own_trip),
@@ -148,6 +181,31 @@ def chat(
     # 새 채팅도 여행 활동이므로, 일반 여행 사이드바 정렬은 여행의 최근 상호작용
     # 시간에 따라 바뀐다.
     touch_trip(client, trip_id)
+
+    # '오늘 점심 식당과 저녁 식당을 바꿔줘'처럼 명확한 요청만 Gemini가 현재
+    # 일정 ID 두 개로 해석한다. 모델은 ID 선택만 하고, 실제 변경은 아래의 RLS
+    # 보호 함수가 같은 여행·같은 DAY인지 다시 확인한 뒤 처리한다.
+    try:
+        swap_request = resolve_itinerary_place_swap_request(
+            dashboard["trip"], dashboard["days"], payload.content
+        )
+        if swap_request:
+            changed = apply_ai_place_swap(client, trip_id, *swap_request)
+            change = changed["change"]
+            return _stream_fixed_answer(
+                client,
+                trip_id,
+                f"요청대로 {change['message']} 아래 일정 변경 카드에서 되돌릴 수도 있어요.",
+            )
+    except HTTPException as error:
+        # 대상이 같은 DAY가 아니거나 이미 삭제된 일정처럼 안전하게 처리할 수 없는
+        # 경우에는 기존 채팅 답변으로 이어간다. 사용자 메시지만 저장된 채 끝나는
+        # 일은 피하고, DB 변경도 이 경로에서는 일어나지 않는다.
+        LOGGER.info("AI 일정 순서 변경을 적용하지 않았습니다: %s", error.detail)
+    except Exception as error:
+        # 구조화 해석은 보조 기능이다. 이 기능의 일시적 오류가 일반 채팅 자체를
+        # 막지 않도록 로그만 남기고 아래의 기존 스트리밍 답변으로 진행한다.
+        LOGGER.warning("AI 일정 순서 변경 해석 실패 (%s).", type(error).__name__)
 
     # 이 지점부터 오류는 이미 열린 SSE 스트림 안에서 전달한다.
     return _stream_answer(client, trip_id, dashboard, history, payload.content)

@@ -32,7 +32,7 @@ from app.openweather_client import (
     OpenWeatherUnavailableError,
 )
 from app.routers.trips import _owned_day, _owned_trip, touch_trip
-from app.schemas import GooglePlaceItineraryCreate
+from app.schemas import AccommodationPlaceUpdate, GooglePlaceItineraryCreate
 from app.services.destination_scope import DestinationScope, resolve_destination_scope
 
 
@@ -562,6 +562,59 @@ def _day_map_payload(
         },
         maps,
     )
+
+
+@router.get("/trips/{trip_id}/accommodation/places/search")
+def search_trip_accommodation_places(
+    trip_id: UUID,
+    query: str = Query(min_length=1, max_length=500),
+    max_results: int = Query(default=3, ge=1, le=6),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """여행 도시 안에서 숙소 후보를 검색한다.
+
+    DAY의 첫 장소를 기준점으로 삼는 일반 일정 검색과 달리, 숙소는 아직 일정에
+    없을 수 있으므로 여행 도시 범위만 엄격히 적용한다.
+    """
+
+    client = get_user_client(current_user.token)
+    trip = _owned_trip(client, trip_id)
+    return _search_response(
+        _maps_client(),
+        query,
+        trip.get("destination"),
+        max_results,
+    )
+
+
+@router.post("/trips/{trip_id}/accommodation")
+def set_trip_accommodation(
+    trip_id: UUID,
+    payload: AccommodationPlaceUpdate,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Google Place ID로 확인한 실제 장소 하나를 여행 숙소로 저장한다."""
+
+    client = get_user_client(current_user.token)
+    _owned_trip(client, trip_id)
+    place = _upsert_place(client, _google_place_row(_maps_client(), payload.google_place_id))
+    try:
+        result = (
+            client.table("trips")
+            .update({"accommodation_place_id": str(place["id"])})
+            .eq("id", str(trip_id))
+            .execute()
+        )
+    except Exception as error:
+        LOGGER.warning("여행 숙소 저장 실패 (%s).", type(error).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="숙소를 저장하지 못했습니다. Supabase 숙소 설정을 확인하세요.",
+        ) from error
+    if not result.data:
+        raise HTTPException(status_code=400, detail="숙소를 저장하지 못했습니다.")
+    touch_trip(client, trip_id)
+    return {"trip": result.data[0], "place": place}
 
 
 @router.get("/trips/{trip_id}/days/{day_id}/places/search")

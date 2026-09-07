@@ -227,6 +227,12 @@ class GooglePlaceItineraryCreate(BaseModel):
     notes: str | None = None
 
 
+class AccommodationPlaceUpdate(BaseModel):
+    """Google에서 검증한 장소 하나를 여행의 숙소로 지정할 때 쓰는 입력값이다."""
+
+    google_place_id: str = Field(min_length=1, max_length=255)
+
+
 class ChatRequest(BaseModel):
     """여행 채팅방에 보낼 사용자 메시지 입력값이다."""
 

@@ -536,6 +536,34 @@ def _attach_cached_places(client, items: list[dict]) -> None:
             item["place"] = place
 
 
+def _attach_accommodation_place(client, trip: dict) -> None:
+    """여행에 지정된 숙소의 Google 장소 정보를 대시보드 응답에 붙인다.
+
+    숙소를 아직 정하지 않은 여행과 숙소 SQL 마이그레이션 전의 기존 여행은 아무
+    변경 없이 통과한다. 장소 캐시를 읽지 못해도 일정 대시보드 자체는 열려야 한다.
+    """
+
+    accommodation_place_id = trip.get("accommodation_place_id")
+    if not accommodation_place_id:
+        return
+    try:
+        result = (
+            client.table("places")
+            .select(
+                "id,display_name,formatted_address,google_rating,"
+                "google_rating_count,google_maps_uri,latitude,longitude,google_place_id"
+            )
+            .eq("id", str(accommodation_place_id))
+            .limit(1)
+            .execute()
+        )
+    except Exception as error:
+        LOGGER.warning("여행 숙소 Google 장소 조회 실패 (%s).", type(error).__name__)
+        return
+    if result.data:
+        trip["accommodation_place"] = result.data[0]
+
+
 def trip_dashboard(client, trip_id: UUID | str) -> dict:
     """여행, DAY 목록, DAY별로 묶인 일정 항목을 대시보드 응답으로 만든다."""
 
@@ -558,6 +586,7 @@ def trip_dashboard(client, trip_id: UUID | str) -> dict:
         .data
     )
     _attach_cached_places(client, items)
+    _attach_accommodation_place(client, trip)
     items_by_day: dict[str, list[dict]] = {}
     for item in items:
         day_id = item.get("trip_day_id")
@@ -1083,6 +1112,110 @@ def update_itinerary_item_time(
 
     touch_trip(client, trip_id)
     return {"item": changed, "change": _change_status(change_log, trip.get("timezone"))}
+
+
+def apply_ai_place_swap(
+    client,
+    trip_id: UUID | str,
+    first_item_id: UUID | str,
+    second_item_id: UUID | str,
+) -> dict:
+    """AI가 확인한 같은 DAY의 두 일정 시간 칸에서 장소 정보만 교환한다.
+
+    자연어 해석 결과는 이 함수에 도달하기 전에 후보 ID 형식만 검증된 값이다.
+    여기서는 현재 사용자 권한, 두 일정의 실제 소속과 DAY 일치를 다시 확인한다.
+    따라서 모델 출력이 잘못되거나 오래된 채팅 요청이 와도 다른 여행·다른 DAY의
+    일정 또는 시간 자체를 바꾸지 않는다.
+    """
+
+    trip = _owned_trip(client, trip_id)
+    first_result = (
+        client.table("itinerary_items")
+        .select("*")
+        .eq("id", str(first_item_id))
+        .eq("trip_id", str(trip_id))
+        .execute()
+    )
+    second_result = (
+        client.table("itinerary_items")
+        .select("*")
+        .eq("id", str(second_item_id))
+        .eq("trip_id", str(trip_id))
+        .execute()
+    )
+    if not first_result.data or not second_result.data:
+        raise HTTPException(status_code=404, detail="바꿀 일정 중 하나를 찾을 수 없습니다.")
+    first_item, second_item = first_result.data[0], second_result.data[0]
+    first_day_id, second_day_id = first_item.get("trip_day_id"), second_item.get("trip_day_id")
+    if not first_day_id or not second_day_id or str(first_day_id) != str(second_day_id):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="AI는 현재 같은 DAY 안의 일정 두 개만 순서를 바꿀 수 있습니다.",
+        )
+    day = _owned_day(client, trip_id, first_day_id)
+
+    before_data = _change_data([first_item, second_item])
+    first_values = {field: second_item.get(field) for field in _PLACE_SLOT_FIELDS}
+    second_values = {field: first_item.get(field) for field in _PLACE_SLOT_FIELDS}
+    try:
+        changed_first = (
+            client.table("itinerary_items")
+            .update(first_values)
+            .eq("id", str(first_item["id"]))
+            .eq("trip_id", str(trip_id))
+            .execute()
+        )
+        changed_second = (
+            client.table("itinerary_items")
+            .update(second_values)
+            .eq("id", str(second_item["id"]))
+            .eq("trip_id", str(trip_id))
+            .execute()
+        )
+        if not changed_first.data or not changed_second.data:
+            raise RuntimeError("AI가 교환한 일정 행을 반환받지 못했습니다.")
+        changed_items = [changed_first.data[0], changed_second.data[0]]
+        change_log = _record_itinerary_change(
+            client,
+            trip_id,
+            action_type="place_swapped",
+            actor_type="ai",
+            before_data=before_data,
+            after_data=_change_data(
+                changed_items,
+                {
+                    "message": f"AI가 DAY {day['day_number']}의 일정 위치를 바꿨어요.",
+                    "detail": (
+                        f"{_clock_text(first_item.get('start_at'), trip.get('timezone'))} "
+                        f"{first_item.get('title') or '일정'}"
+                        f" ↔ {_clock_text(second_item.get('start_at'), trip.get('timezone'))} "
+                        f"{second_item.get('title') or '일정'}"
+                    ),
+                },
+            ),
+        )
+    except Exception as error:
+        # 두 update와 로그 기록을 하나의 변경으로 취급한다. 중간 실패면 장소 정보도
+        # 원상 복구해 시간 칸 두 개가 반만 교환되는 상태를 남기지 않는다.
+        try:
+            client.table("itinerary_items").update(
+                {field: first_item.get(field) for field in _PLACE_SLOT_FIELDS}
+            ).eq("id", str(first_item["id"])).eq("trip_id", str(trip_id)).execute()
+            client.table("itinerary_items").update(
+                {field: second_item.get(field) for field in _PLACE_SLOT_FIELDS}
+            ).eq("id", str(second_item["id"])).eq("trip_id", str(trip_id)).execute()
+        except Exception:
+            LOGGER.error("실패한 AI 일정 장소 교환 복구에 실패했습니다.")
+        if isinstance(error, HTTPException):
+            raise error
+        LOGGER.warning("AI 일정 장소 교환 실패 (%s).", type(error).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="AI가 일정 순서를 바꾸지 못했습니다.",
+        ) from error
+
+    touch_trip(client, trip_id)
+    return {"items": changed_items, "change": _change_status(change_log, trip.get("timezone"))}
 
 
 @router.post("/trips/{trip_id}/itinerary-items/{item_id}/swap-place")
