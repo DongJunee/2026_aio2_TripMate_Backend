@@ -5,7 +5,7 @@ import json
 from dataclasses import dataclass
 from uuid import UUID
 
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.cache import cache_get, cache_set
@@ -27,6 +27,7 @@ class CurrentUser:
 
 
 def get_current_user(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
 ) -> CurrentUser:
     """Bearer 토큰을 검증하고, 성공 시 현재 사용자 정보를 반환한다."""
@@ -38,7 +39,9 @@ def get_current_user(
     cached = cache_get(cache_key)
     if cached:
         data = json.loads(cached)
-        return CurrentUser(id=data["id"], email=data["email"], token=token)
+        current_user = CurrentUser(id=data["id"], email=data["email"], token=token)
+        request.state.user_id = current_user.id
+        return current_user
 
     try:
         user = get_anon_client().auth.get_user(token).user
@@ -49,6 +52,7 @@ def get_current_user(
         raise HTTPException(status_code=401, detail="유효하지 않은 로그인입니다.")
 
     current_user = CurrentUser(id=str(user.id), email=user.email, token=token)
+    request.state.user_id = current_user.id
     cache_set(
         cache_key,
         json.dumps({"id": current_user.id, "email": current_user.email}),

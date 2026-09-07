@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.request_logging import ApiRequestLoggingMiddleware
+from app.routers import dashboard
 from app.routers import auth, chat, maps, me, trips
 
 # FastAPI 앱은 모든 backend API의 시작점이다.
@@ -13,12 +15,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(ApiRequestLoggingMiddleware)
 
 app.include_router(auth.router)
 app.include_router(me.router)
 app.include_router(trips.router)
 app.include_router(chat.router)
 app.include_router(maps.router)
+app.include_router(dashboard.router)
 
 
 @app.get("/health")

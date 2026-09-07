@@ -12,13 +12,17 @@ FastAPI backend for the TripMate travel planner.
    The classroom password-reset feature additionally needs
    `SUPABASE_SERVICE_ROLE_KEY` in this backend-only file. Never put that key
    in the frontend `.env` or commit it to Git.
-   To use place search and route data, add `GOOGLE_MAPS_API_KEY` here for
-   backend calls.
+To use place search and route data, add `GOOGLE_MAPS_API_KEY` here for
+backend calls.
    A Maps Demo Key supports Places API (New) and Compute Routes for local
    prototyping; a standard key needs the corresponding APIs enabled in Google
    Cloud. For this classroom prototype, the interactive frontend map can reuse
    this same key value through its own `GOOGLE_MAPS_API_KEY` secret.
 3. Redis is optional. Leave all Redis values blank to run without caching.
+
+During local dashboard testing, `DASHBOARD_AUTH_DISABLED=true` allows the
+dashboard endpoints to be called without an admin token. Set it to `false` or
+remove it before sharing or deploying the backend.
 
 ## Run
 
