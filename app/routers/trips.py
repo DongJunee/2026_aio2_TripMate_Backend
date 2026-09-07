@@ -111,24 +111,48 @@ def _record_itinerary_change(
     return result.data[0]
 
 
-def _clock_text(value: object) -> str:
-    """ISO 시각 또는 datetime을 상태 카드에 쓸 HH:MM 문자열로 바꾼다."""
+def _clock_text(value: object, timezone_name: object) -> str:
+    """저장된 UTC 시각을 여행지 현지 시각의 HH:MM 문자열로 바꾼다."""
 
-    if isinstance(value, datetime):
-        return value.strftime("%H:%M")
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).strftime("%H:%M")
-    except (TypeError, ValueError):
+        parsed = value if isinstance(value, datetime) else datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        )
+        zone = ZoneInfo(str(timezone_name or "Asia/Seoul"))
+        # 과거 데이터처럼 시간대가 빠진 값은 서버 시간대가 아닌 여행지 현지
+        # 벽시계 시각으로 해석한다.
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=zone)
+        else:
+            parsed = parsed.astimezone(zone)
+        return parsed.strftime("%H:%M")
+    except (TypeError, ValueError, ZoneInfoNotFoundError):
         return "시간 미정"
 
 
-def _change_status(log: dict) -> dict:
+def _change_status(log: dict, timezone_name: object) -> dict:
     """프론트의 일정 변경 상태 카드에 필요한 안전한 로그 요약을 반환한다."""
 
     action_type = str(log.get("action_type") or "")
     after_data = log.get("after_data") if isinstance(log.get("after_data"), dict) else {}
+    before_data = log.get("before_data") if isinstance(log.get("before_data"), dict) else {}
     summary = after_data.get("summary") if isinstance(after_data.get("summary"), dict) else {}
     message = str(summary.get("message") or "일정이 변경되었습니다.")
+    detail = str(summary.get("detail") or "")
+    # 이미 저장된 로그도 전후 스냅샷은 UTC 시각을 갖고 있다. 화면을 다시 불러올
+    # 때 여행 시간대로 문구를 조립하면, 예전 카드까지 UTC가 아닌 현지 시각으로
+    # 바로잡을 수 있다.
+    before_items = before_data.get("items") if isinstance(before_data.get("items"), list) else []
+    after_items = after_data.get("items") if isinstance(after_data.get("items"), list) else []
+    if action_type == "time_changed" and before_items and after_items:
+        before_item, after_item = before_items[0], after_items[0]
+        if isinstance(before_item, dict) and isinstance(after_item, dict):
+            detail = (
+                f"{_clock_text(before_item.get('start_at'), timezone_name)}"
+                f"–{_clock_text(before_item.get('end_at'), timezone_name)}"
+                f" → {_clock_text(after_item.get('start_at'), timezone_name)}"
+                f"–{_clock_text(after_item.get('end_at'), timezone_name)}"
+            )
     is_undo = action_type == "undo"
     can_undo = (
         not is_undo
@@ -138,7 +162,7 @@ def _change_status(log: dict) -> dict:
         "id": log.get("id"),
         "action_type": action_type,
         "message": message,
-        "detail": str(summary.get("detail") or ""),
+        "detail": detail,
         "created_at": log.get("created_at"),
         "can_undo": can_undo,
     }
@@ -1032,8 +1056,10 @@ def update_itinerary_item_time(
                         f"DAY {day['day_number']}의 {changed.get('title') or '일정'} 시간이 변경되었습니다."
                     ),
                     "detail": (
-                        f"{_clock_text(existing.get('start_at'))}–{_clock_text(existing.get('end_at'))}"
-                        f" → {_clock_text(changed.get('start_at'))}–{_clock_text(changed.get('end_at'))}"
+                        f"{_clock_text(existing.get('start_at'), trip.get('timezone'))}"
+                        f"–{_clock_text(existing.get('end_at'), trip.get('timezone'))}"
+                        f" → {_clock_text(changed.get('start_at'), trip.get('timezone'))}"
+                        f"–{_clock_text(changed.get('end_at'), trip.get('timezone'))}"
                     ),
                 },
             ),
@@ -1056,7 +1082,7 @@ def update_itinerary_item_time(
         raise HTTPException(status_code=500, detail="일정 시간을 변경하지 못했습니다.") from error
 
     touch_trip(client, trip_id)
-    return {"item": changed, "change": _change_status(change_log)}
+    return {"item": changed, "change": _change_status(change_log, trip.get("timezone"))}
 
 
 @router.post("/trips/{trip_id}/itinerary-items/{item_id}/swap-place")
@@ -1069,7 +1095,7 @@ def swap_itinerary_item_place(
     """일정 칸의 장소를 바로 앞 또는 뒤 시간 칸의 장소와 교환한다."""
 
     client = get_user_client(current_user.token)
-    _owned_trip(client, trip_id)
+    trip = _owned_trip(client, trip_id)
     item_result = (
         client.table("itinerary_items")
         .select("*")
@@ -1129,8 +1155,10 @@ def swap_itinerary_item_place(
                 {
                     "message": f"DAY {day['day_number']}의 일정 순서가 변경되었습니다.",
                     "detail": (
-                        f"{_clock_text(current_item.get('start_at'))} {current_item.get('title') or '일정'}"
-                        f" ↔ {_clock_text(target_item.get('start_at'))} {target_item.get('title') or '일정'}"
+                        f"{_clock_text(current_item.get('start_at'), trip.get('timezone'))} "
+                        f"{current_item.get('title') or '일정'}"
+                        f" ↔ {_clock_text(target_item.get('start_at'), trip.get('timezone'))} "
+                        f"{target_item.get('title') or '일정'}"
                     ),
                 },
             ),
@@ -1152,7 +1180,7 @@ def swap_itinerary_item_place(
         raise HTTPException(status_code=500, detail="일정 순서를 변경하지 못했습니다.") from error
 
     touch_trip(client, trip_id)
-    return {"items": changed_items, "change": _change_status(change_log)}
+    return {"items": changed_items, "change": _change_status(change_log, trip.get("timezone"))}
 
 
 @router.get("/trips/{trip_id}/itinerary-changes")
@@ -1163,7 +1191,7 @@ def list_itinerary_changes(
     """채팅 타임라인에 섞어 표시할 모든 일정 변경 상태를 시간순으로 반환한다."""
 
     client = get_user_client(current_user.token)
-    _owned_trip(client, trip_id)
+    trip = _owned_trip(client, trip_id)
     result = (
         client.table("itinerary_change_logs")
         .select("*")
@@ -1171,7 +1199,7 @@ def list_itinerary_changes(
         .order("created_at")
         .execute()
     )
-    return [_change_status(change) for change in (result.data or [])]
+    return [_change_status(change, trip.get("timezone")) for change in (result.data or [])]
 
 
 def _undo_fields(action_type: str) -> tuple[str, ...]:
@@ -1184,13 +1212,27 @@ def _undo_fields(action_type: str) -> tuple[str, ...]:
     raise HTTPException(status_code=422, detail="이 변경은 아직 버튼으로 되돌릴 수 없습니다.")
 
 
+def _undo_values_match(field: str, current_value: object, saved_value: object) -> bool:
+    """현재 값이 해당 변경 직후 값과 같은지 비교해 선택 Undo의 안전성을 확인한다."""
+
+    if field in {"start_at", "end_at"}:
+        try:
+            current_time = datetime.fromisoformat(str(current_value).replace("Z", "+00:00"))
+            saved_time = datetime.fromisoformat(str(saved_value).replace("Z", "+00:00"))
+            return current_time == saved_time
+        except (TypeError, ValueError):
+            # 둘 다 null인 경우처럼 문자열 변환 비교가 더 정확한 값도 허용한다.
+            return current_value == saved_value
+    return current_value == saved_value
+
+
 @router.post("/trips/{trip_id}/itinerary-changes/{log_id}/undo")
 def undo_itinerary_change(
     trip_id: UUID,
     log_id: UUID,
     current_user: CurrentUser = Depends(get_current_user),
 ):
-    """마지막 일정 변경 한 건을 로그의 변경 전 값으로 정확히 되돌린다."""
+    """선택한 일정 변경 한 건을 안전할 때만 로그의 변경 전 값으로 되돌린다."""
 
     client = get_user_client(current_user.token)
     _owned_trip(client, trip_id)
@@ -1207,23 +1249,18 @@ def undo_itinerary_change(
     if source_log.get("is_reverted") or source_log.get("action_type") == "undo":
         raise HTTPException(status_code=409, detail="이미 되돌렸거나 되돌릴 수 없는 변경입니다.")
 
-    # 상태 카드가 예전 화면에 남은 채 눌려도, 더 최근의 수정 내용을 덮어쓰지 않게 한다.
-    latest_result = (
-        client.table("itinerary_change_logs")
-        .select("id")
-        .eq("trip_id", str(trip_id))
-        .order("created_at", desc=True)
-        .limit(1)
-        .execute()
-    )
-    if not latest_result.data or str(latest_result.data[0]["id"]) != str(source_log["id"]):
-        raise HTTPException(status_code=409, detail="가장 최근 일정 변경만 되돌릴 수 있습니다.")
-
     before_data = source_log.get("before_data") if isinstance(source_log.get("before_data"), dict) else {}
     snapshots = before_data.get("items") if isinstance(before_data.get("items"), list) else []
     if not snapshots:
         raise HTTPException(status_code=422, detail="이 변경에는 복원할 이전 일정 정보가 없습니다.")
     fields = _undo_fields(str(source_log.get("action_type") or ""))
+    after_data = source_log.get("after_data") if isinstance(source_log.get("after_data"), dict) else {}
+    after_snapshots = after_data.get("items") if isinstance(after_data.get("items"), list) else []
+    after_by_id = {
+        str(item.get("id")): item
+        for item in after_snapshots
+        if isinstance(item, dict) and item.get("id")
+    }
 
     current_items: list[dict] = []
     try:
@@ -1239,7 +1276,22 @@ def undo_itinerary_change(
             )
             if not existing.data:
                 raise HTTPException(status_code=409, detail="변경 뒤 삭제된 일정이 있어 되돌릴 수 없습니다.")
-            current_items.append(existing.data[0])
+            current_item = existing.data[0]
+            after_item = after_by_id.get(str(snapshot["id"]))
+            if after_item is None:
+                raise HTTPException(status_code=422, detail="이 변경에는 비교할 이후 일정 정보가 없습니다.")
+            # 시간 변경 뒤 장소 순서를 바꾼 것처럼 서로 다른 필드의 수정은 허용한다.
+            # 반대로 같은 필드가 다시 수정됐다면 이 옛 변경을 복원하면 최신 값이
+            # 사라지므로, 먼저 그 최신 변경을 처리하도록 안내한다.
+            if any(
+                not _undo_values_match(field, current_item.get(field), after_item.get(field))
+                for field in fields
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="이 변경 뒤 같은 일정 정보가 다시 수정되어 안전하게 되돌릴 수 없습니다. 해당 최신 변경을 먼저 되돌려 주세요.",
+                )
+            current_items.append(current_item)
 
         for snapshot in snapshots:
             values = {field: snapshot.get(field) for field in fields}
@@ -1274,7 +1326,7 @@ def undo_itinerary_change(
                 "items": snapshots,
                 "summary": {
                     "message": "변경 취소하였습니다.",
-                    "detail": "직전 일정 변경을 이전 상태로 복원했습니다.",
+                    "detail": "선택한 일정 변경을 이전 상태로 복원했습니다.",
                 },
             },
             undo_of_log_id=source_log["id"],
@@ -1302,7 +1354,7 @@ def undo_itinerary_change(
         raise HTTPException(status_code=500, detail="일정 변경을 취소하지 못했습니다.") from error
 
     touch_trip(client, trip_id)
-    return {"change": _change_status(undo_log)}
+    return {"change": _change_status(undo_log, trip.get("timezone"))}
 
 
 @router.delete(

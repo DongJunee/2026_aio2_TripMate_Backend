@@ -223,6 +223,7 @@ class GooglePlaceItineraryCreate(BaseModel):
     estimated_stay_minutes: int = Field(default=60, ge=0, le=1440)
     is_fixed: bool = False
     travel_mode: TravelMode | None = "walk"
+    source: ItemSource = "google_search"
     notes: str | None = None
 
 

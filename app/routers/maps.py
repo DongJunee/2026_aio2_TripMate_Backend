@@ -26,8 +26,14 @@ from app.google_maps_client import (
     GoogleMapsUnavailableError,
     StaticMapMarker,
 )
+from app.openweather_client import (
+    OpenWeatherClient,
+    OpenWeatherError,
+    OpenWeatherUnavailableError,
+)
 from app.routers.trips import _owned_day, _owned_trip, touch_trip
 from app.schemas import GooglePlaceItineraryCreate
+from app.services.destination_scope import DestinationScope, resolve_destination_scope
 
 
 router = APIRouter(tags=["maps"])
@@ -41,6 +47,8 @@ RouteTravelMode = Literal["walk", "transit", "drive", "bicycle"]
 # Redis가 설정되지 않았을 때 지도 JSON 요청과 바로 이어지는 이미지 요청이 같은
 # 유료 경로를 두 번 계산하지 않게 한다.
 _ROUTE_MEMORY_CACHE: dict[str, tuple[float, dict]] = {}
+_DESTINATION_SCOPE_MEMORY_CACHE: dict[str, tuple[float, DestinationScope]] = {}
+DESTINATION_SCOPE_CACHE_TTL_SECONDS = 3_600
 
 
 def _cache_key(prefix: str, values: object) -> str:
@@ -65,13 +73,100 @@ def _maps_request_error(error: GoogleMapsError) -> HTTPException:
     return HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(error))
 
 
-def _search_response(maps: GoogleMapsClient, text_query: str, destination: str | None, max_results: int) -> dict:
+def _destination_scope_for_search(
+    maps: GoogleMapsClient, destination: str | None
+) -> DestinationScope | None:
+    """여행 도시 범위를 짧게 재사용해 다른 나라·도시 검색 결과를 막는다."""
+
+    normalized_destination = " ".join(str(destination or "").casefold().split())
+    if not normalized_destination:
+        return None
+    cached = _DESTINATION_SCOPE_MEMORY_CACHE.get(normalized_destination)
+    if cached and cached[0] > time.monotonic():
+        return cached[1]
+    try:
+        scope = resolve_destination_scope(maps, str(destination))
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except GoogleMapsError as error:
+        raise _maps_request_error(error) from error
+    _DESTINATION_SCOPE_MEMORY_CACHE[normalized_destination] = (
+        time.monotonic() + DESTINATION_SCOPE_CACHE_TTL_SECONDS,
+        scope,
+    )
+    return scope
+
+
+def _places_inside_destination(
+    maps: GoogleMapsClient, scope: DestinationScope | None, candidates: list
+) -> list:
+    """Google 응답도 도시·국가·좌표 기준으로 다시 확인해 범위 밖 후보를 제거한다."""
+
+    if scope is None:
+        return candidates
+    accepted = [place for place in candidates if scope.accepts(place)]
+    if accepted:
+        return accepted
+    # 도시명 표기가 한국어·영어로 달라지는 경우에만 같은 Google 도시 ID의 영문
+    # 주소 별칭을 한 번 보완한다. 이 과정에서도 범위를 넓히지는 않는다.
+    if not any(
+        scope.rejection_reason(place) in {"city_name_mismatch", "administrative_name_mismatch"}
+        for place in candidates
+    ):
+        return []
+    try:
+        scope_with_aliases = scope.with_city_aliases(
+            maps.get_city_details(scope.google_place_id, language_code="en")
+        )
+    except (GoogleMapsError, ValueError):
+        return []
+    return [place for place in candidates if scope_with_aliases.accepts(place)]
+
+
+def _day_reference_location(client, trip_id: UUID | str, day_id: UUID | str) -> Coordinates | None:
+    """현재 DAY에서 좌표가 확인된 첫 일정 장소를 검색 우선 위치로 사용한다."""
+
+    try:
+        markers, _ = _day_place_markers(client, trip_id, day_id)
+    except HTTPException:
+        # 기준 좌표가 없어도 도시 범위 제한 검색은 가능하므로, 검색 자체를 막지
+        # 않고 아래의 destination scope 검증으로 안전성을 유지한다.
+        return None
+    if not markers:
+        return None
+    marker = markers[0]
+    return Coordinates(latitude=float(marker["latitude"]), longitude=float(marker["longitude"]))
+
+
+def _search_response(
+    maps: GoogleMapsClient,
+    text_query: str,
+    destination: str | None,
+    max_results: int,
+    *,
+    location_bias: Coordinates | None = None,
+) -> dict:
     """여행별 검색어에 대한 캐시된 Places 텍스트 검색 카드를 반환한다."""
 
     # 여행지를 붙이면 "카페" 같은 단순 검색어도 올바른 도시에 집중하면서,
     # 정확한 장소 이름을 입력하는 경우도 허용할 수 있다.
     full_query = " ".join(part for part in (text_query.strip(), (destination or "").strip()) if part)
-    cache_key = _cache_key("google_places_search", {"query": full_query, "limit": max_results})
+    cache_key = _cache_key(
+        "google_places_search",
+        {
+            "query": full_query,
+            "limit": max_results,
+            # 이전에는 도시 범위 재검증 전 응답이 캐시될 수 있었다. 같은 검색어라도
+            # 새 필터 정책의 결과를 즉시 쓰도록 캐시 서명을 분리한다.
+            "scope_filter": "destination-v1",
+            # 기준 장소 주변 추천은 일반 도시 검색과 캐시를 분리해야 한다.
+            "location_bias": (
+                (round(location_bias.latitude, 5), round(location_bias.longitude, 5))
+                if location_bias
+                else None
+            ),
+        },
+    )
     cached = cache_get(cache_key)
     if cached:
         try:
@@ -80,15 +175,28 @@ def _search_response(maps: GoogleMapsClient, text_query: str, destination: str |
             # 형식이 잘못된 선택적 캐시 항목이 실제 검색을 막으면 안 된다.
             pass
 
+    scope = _destination_scope_for_search(maps, destination)
     try:
-        places = maps.search_places(full_query, max_results=max_results, language_code="ko")
+        places = maps.search_places(
+            full_query,
+            max_results=max_results,
+            language_code="ko",
+            location_bias=location_bias,
+            radius_meters=2_500,
+            # 지도 기준점이 없을 때는 Google에도 도시 사각 범위를 엄격히 전달한다.
+            # 기준점이 있으면 bias와 restriction을 함께 보낼 수 없으므로, 아래의
+            # scope.accepts 검사가 도시·국가 밖 결과를 최종적으로 제거한다.
+            location_restriction=scope.viewport if scope and location_bias is None else None,
+            include_region_metadata=scope is not None,
+        )
     except GoogleMapsError as error:
         raise _maps_request_error(error) from error
 
+    scoped_places = _places_inside_destination(maps, scope, places)
     response = {
         "query": text_query.strip(),
         "resolved_query": full_query,
-        "places": [place.as_place_row() for place in places],
+        "places": [place.as_place_row() for place in scoped_places],
     }
     cache_set(cache_key, json.dumps(response, ensure_ascii=False), PLACE_SEARCH_CACHE_TTL_SECONDS)
     return response
@@ -365,8 +473,8 @@ def _automatic_route_plan(maps: GoogleMapsClient, markers: list[dict]) -> dict:
     }
 
 
-def _weather_for_day(maps: GoogleMapsClient, trip: dict, day: dict, markers: list[dict]) -> dict:
-    """예보 범위 안의 여행일만 조회하고 설정·범위 오류는 안내값으로 돌려준다."""
+def _weather_for_day(trip: dict, day: dict, markers: list[dict]) -> dict:
+    """OpenWeather 예보를 여행 화면에서 쓸 수 있는 일별 값으로 반환한다."""
 
     if not markers:
         return {"status": "unavailable", "label": "장소 좌표 없음"}
@@ -378,11 +486,13 @@ def _weather_for_day(maps: GoogleMapsClient, trip: dict, day: dict, markers: lis
     offset = (travel_date - local_today).days
     if offset < 0:
         return {"status": "unavailable", "label": "지난 날짜"}
-    if offset > 9:
+    # OpenWeather의 기본 5일/3시간 예보를 사용한다. 유료 One Call API 구독 없이
+    # 쓸 수 있는 범위이며, 그 이후 날짜는 API에 요청하지 않고 안내만 표시한다.
+    if offset > 5:
         return {"status": "pending", "label": "예보 전"}
 
     signature = {"lat": markers[0]["latitude"], "lng": markers[0]["longitude"], "date": str(travel_date)}
-    cache_key = _cache_key("google_weather", signature)
+    cache_key = _cache_key("openweather_daily", signature)
     cached = cache_get(cache_key)
     if cached:
         try:
@@ -390,30 +500,25 @@ def _weather_for_day(maps: GoogleMapsClient, trip: dict, day: dict, markers: lis
         except json.JSONDecodeError:
             pass
     try:
-        forecasts = maps.get_daily_forecast(
-            Coordinates(markers[0]["latitude"], markers[0]["longitude"]), days=offset + 1
+        forecasts = OpenWeatherClient.from_environment().get_daily_forecasts(
+            Coordinates(markers[0]["latitude"], markers[0]["longitude"])
         )
-    except GoogleMapsError:
+    except OpenWeatherUnavailableError:
+        return {"status": "unavailable", "label": "OpenWeather 키 확인 필요"}
+    except OpenWeatherError:
         return {"status": "unavailable", "label": "예보 확인 안 됨"}
     forecast = next(
-        (
-            value for value in forecasts
-            if value.get("displayDate") == {
-                "year": travel_date.year, "month": travel_date.month, "day": travel_date.day
-            }
-        ),
+        (value for value in forecasts if value.get("date") == str(travel_date)),
         None,
     )
     if not forecast:
-        return {"status": "unavailable", "label": "예보 확인 안 됨"}
-    daytime = forecast.get("daytimeForecast") or {}
-    condition = daytime.get("weatherCondition") or {}
+        return {"status": "pending", "label": "예보 전"}
     result = {
         "status": "ok",
-        "label": str((condition.get("description") or {}).get("text") or "날씨 정보"),
-        "min_celsius": (forecast.get("minTemperature") or {}).get("degrees"),
-        "max_celsius": (forecast.get("maxTemperature") or {}).get("degrees"),
-        "precipitation_percent": (((daytime.get("precipitation") or {}).get("probability") or {}).get("percent")),
+        "label": str(forecast.get("label") or "날씨 정보"),
+        "min_celsius": forecast.get("min_celsius"),
+        "max_celsius": forecast.get("max_celsius"),
+        "precipitation_percent": forecast.get("precipitation_percent"),
     }
     cache_set(cache_key, json.dumps(result, ensure_ascii=False), WEATHER_CACHE_TTL_SECONDS)
     return result
@@ -465,6 +570,8 @@ def search_trip_places(
     day_id: UUID,
     query: str = Query(min_length=1, max_length=500),
     max_results: int = Query(default=6, ge=1, le=10),
+    near_latitude: float | None = Query(default=None, ge=-90, le=90),
+    near_longitude: float | None = Query(default=None, ge=-180, le=180),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     """키를 노출하지 않고 접근 가능한 여행의 여행지에서 Google Places를 검색한다."""
@@ -472,7 +579,25 @@ def search_trip_places(
     client = get_user_client(current_user.token)
     trip = _owned_trip(client, trip_id)
     _owned_day(client, trip_id, day_id)
-    return _search_response(_maps_client(), query, trip.get("destination"), max_results)
+    if (near_latitude is None) != (near_longitude is None):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="주변 장소 검색에는 위도와 경도를 함께 입력하세요.",
+        )
+    location_bias = (
+        Coordinates(latitude=near_latitude, longitude=near_longitude)
+        if near_latitude is not None and near_longitude is not None
+        # 추천 문장이 특정 장소를 가리킨 경우 프론트가 그 장소 좌표를 보낸다.
+        # 일반 검색도 현재 DAY 안의 실제 장소 하나를 기준으로 우선 정렬한다.
+        else _day_reference_location(client, trip_id, day_id)
+    )
+    return _search_response(
+        _maps_client(),
+        query,
+        trip.get("destination"),
+        max_results,
+        location_bias=location_bias,
+    )
 
 
 @router.post(
@@ -512,7 +637,7 @@ def add_google_place_to_day(
         "trip_day_id": str(day_id),
         "place_id": place["id"],
         "item_type": payload.item_type,
-        "source": "google_search",
+        "source": payload.source,
         "title": place.get("display_name") or "Google 검색 장소",
         "start_at": payload.start_at.isoformat(),
         "end_at": (payload.start_at + timedelta(minutes=payload.estimated_stay_minutes)).isoformat(),
@@ -570,7 +695,7 @@ def read_day_route_plan(
     plan = _automatic_route_plan(maps, markers)
     return {
         "day_id": str(day_id), "markers": markers, "skipped_item_count": skipped_count,
-        **plan, "weather": _weather_for_day(maps, trip, day, markers),
+        **plan, "weather": _weather_for_day(trip, day, markers),
     }
 
 
