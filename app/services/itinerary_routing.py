@@ -27,7 +27,9 @@ def group_nearby_itinerary_places(
     groups: dict[tuple, list[int]] = {}
     for index, row in enumerate(rows):
         place_id = str(row.get("place_id") or "")
-        if place_id not in coordinates or not row.get("start_at"):
+        # 일부 단위 테스트나 이전 데이터에는 DAY 연결값이 없을 수 있다. 그런 행은
+        # 기존 순서를 그대로 유지하며 전체 일정 생성을 실패시키지 않는다.
+        if place_id not in coordinates or not row.get("start_at") or not row.get("trip_day_id"):
             continue
         by_day.setdefault(str(row["trip_day_id"]), []).append(index)
         if row.get("is_fixed") or row.get("item_type") not in {"place", "restaurant"}:

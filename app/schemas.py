@@ -1,6 +1,6 @@
 """API 요청 모델 모음이다. DB가 만드는 ID와 시간은 UI에서 받지 않는다."""
 
-from datetime import date, datetime
+from datetime import date, datetime, time
 from typing import Literal
 from uuid import UUID
 
@@ -186,6 +186,27 @@ class ItineraryItemUpdate(BaseModel):
     travel_mode: TravelMode | None = None
     notes: str | None = None
     sort_order: int | None = Field(default=None, ge=0)
+
+
+class ItineraryItemTimeUpdate(BaseModel):
+    """일정 한 칸의 시작·종료 시각을 사용자가 직접 바꿀 때 쓰는 입력값이다."""
+
+    start_time: time
+    end_time: time
+
+    @model_validator(mode="after")
+    def validate_time_order(self):
+        """같은 DAY 안에서 종료 시각이 시작 시각보다 빠르지 않게 한다."""
+
+        if self.end_time <= self.start_time:
+            raise ValueError("종료 시간은 시작 시간보다 늦어야 합니다.")
+        return self
+
+
+class ItineraryPlaceSwap(BaseModel):
+    """일정 시간 칸의 장소를 바로 앞 또는 뒤 칸과 교환하는 입력값이다."""
+
+    direction: Literal["previous", "next"]
 
 
 class GooglePlaceItineraryCreate(BaseModel):

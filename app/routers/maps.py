@@ -9,9 +9,10 @@ import hashlib
 import json
 import logging
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Literal
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 
@@ -34,6 +35,7 @@ LOGGER = logging.getLogger(__name__)
 PLACE_SEARCH_CACHE_TTL_SECONDS = 300
 PLACE_DETAILS_CACHE_TTL_SECONDS = 86_400
 ROUTE_CACHE_TTL_SECONDS = 900
+WEATHER_CACHE_TTL_SECONDS = 3_600
 RouteTravelMode = Literal["walk", "transit", "drive", "bicycle"]
 # 이 실습 프로젝트에서 Redis는 선택 사항이다. 작은 프로세스 내부 대체 캐시는
 # Redis가 설정되지 않았을 때 지도 JSON 요청과 바로 이어지는 이미지 요청이 같은
@@ -301,6 +303,122 @@ def _route_for_markers(
     return route
 
 
+def _automatic_route_plan(maps: GoogleMapsClient, markers: list[dict]) -> dict:
+    """각 장소 사이에서 도보 20분 기준으로 현실적인 이동 수단을 선택한다."""
+
+    legs: list[dict] = []
+    route_segments: list[dict] = []
+    total_distance = 0
+    total_duration = 0.0
+    unknown_count = 0
+    for origin, destination in zip(markers, markers[1:]):
+        pair = [origin, destination]
+        walk = None
+        try:
+            walk = _route_for_markers(maps, pair, "walk")
+        except HTTPException:
+            pass
+
+        selected = walk if walk and float(walk["duration_seconds"]) <= 20 * 60 else None
+        if selected is None:
+            alternatives = []
+            for mode in ("transit", "drive"):
+                try:
+                    route = _route_for_markers(maps, pair, mode)
+                except HTTPException:
+                    continue
+                if route:
+                    alternatives.append(route)
+            if alternatives:
+                selected = min(alternatives, key=lambda route: float(route["duration_seconds"]))
+
+        leg = {
+            "from_itinerary_item_id": origin["itinerary_item_id"],
+            "to_itinerary_item_id": destination["itinerary_item_id"],
+            "from_title": origin["title"],
+            "to_title": destination["title"],
+            "status": "ok" if selected else "unknown",
+        }
+        if selected:
+            leg.update(selected)
+            total_distance += int(selected["distance_meters"])
+            total_duration += float(selected["duration_seconds"])
+            if selected.get("encoded_polyline"):
+                route_segments.append(
+                    {
+                        "travel_mode": selected["travel_mode"],
+                        "encoded_polyline": selected["encoded_polyline"],
+                    }
+                )
+        else:
+            leg["travel_mode"] = None
+            leg["duration_seconds"] = None
+            leg["distance_meters"] = None
+            unknown_count += 1
+        legs.append(leg)
+    return {
+        "legs": legs,
+        "route_segments": route_segments,
+        "total_distance_meters": total_distance,
+        "total_duration_seconds": total_duration,
+        "unknown_leg_count": unknown_count,
+    }
+
+
+def _weather_for_day(maps: GoogleMapsClient, trip: dict, day: dict, markers: list[dict]) -> dict:
+    """예보 범위 안의 여행일만 조회하고 설정·범위 오류는 안내값으로 돌려준다."""
+
+    if not markers:
+        return {"status": "unavailable", "label": "장소 좌표 없음"}
+    try:
+        travel_date = date.fromisoformat(str(day["travel_date"]))
+        local_today = datetime.now(ZoneInfo(str(trip.get("timezone") or "UTC"))).date()
+    except (KeyError, TypeError, ValueError, ZoneInfoNotFoundError):
+        return {"status": "unavailable", "label": "날짜 확인 필요"}
+    offset = (travel_date - local_today).days
+    if offset < 0:
+        return {"status": "unavailable", "label": "지난 날짜"}
+    if offset > 9:
+        return {"status": "pending", "label": "예보 전"}
+
+    signature = {"lat": markers[0]["latitude"], "lng": markers[0]["longitude"], "date": str(travel_date)}
+    cache_key = _cache_key("google_weather", signature)
+    cached = cache_get(cache_key)
+    if cached:
+        try:
+            return json.loads(cached)
+        except json.JSONDecodeError:
+            pass
+    try:
+        forecasts = maps.get_daily_forecast(
+            Coordinates(markers[0]["latitude"], markers[0]["longitude"]), days=offset + 1
+        )
+    except GoogleMapsError:
+        return {"status": "unavailable", "label": "예보 확인 안 됨"}
+    forecast = next(
+        (
+            value for value in forecasts
+            if value.get("displayDate") == {
+                "year": travel_date.year, "month": travel_date.month, "day": travel_date.day
+            }
+        ),
+        None,
+    )
+    if not forecast:
+        return {"status": "unavailable", "label": "예보 확인 안 됨"}
+    daytime = forecast.get("daytimeForecast") or {}
+    condition = daytime.get("weatherCondition") or {}
+    result = {
+        "status": "ok",
+        "label": str((condition.get("description") or {}).get("text") or "날씨 정보"),
+        "min_celsius": (forecast.get("minTemperature") or {}).get("degrees"),
+        "max_celsius": (forecast.get("maxTemperature") or {}).get("degrees"),
+        "precipitation_percent": (((daytime.get("precipitation") or {}).get("probability") or {}).get("percent")),
+    }
+    cache_set(cache_key, json.dumps(result, ensure_ascii=False), WEATHER_CACHE_TTL_SECONDS)
+    return result
+
+
 def _day_map_payload(
     client,
     trip_id: UUID | str,
@@ -427,6 +545,33 @@ def read_day_map(
     client = get_user_client(current_user.token)
     payload, _ = _day_map_payload(client, trip_id, day_id, travel_mode)
     return payload
+
+
+@router.get("/trips/{trip_id}/days/{day_id}/route-plan")
+def read_day_route_plan(
+    trip_id: UUID,
+    day_id: UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """DAY의 자동 이동 수단·구간·총합과 선택 날짜의 날씨를 반환한다."""
+
+    client = get_user_client(current_user.token)
+    trip = _owned_trip(client, trip_id)
+    day = _owned_day(client, trip_id, day_id)
+    markers, skipped_count = _day_place_markers(client, trip_id, day_id)
+    if not markers:
+        return {
+            "day_id": str(day_id), "markers": [], "skipped_item_count": skipped_count,
+            "legs": [], "route_segments": [], "total_distance_meters": 0,
+            "total_duration_seconds": 0, "unknown_leg_count": 0,
+            "weather": {"status": "unavailable", "label": "장소 좌표 없음"},
+        }
+    maps = _maps_client()
+    plan = _automatic_route_plan(maps, markers)
+    return {
+        "day_id": str(day_id), "markers": markers, "skipped_item_count": skipped_count,
+        **plan, "weather": _weather_for_day(maps, trip, day, markers),
+    }
 
 
 @router.get("/trips/{trip_id}/days/{day_id}/map/image")

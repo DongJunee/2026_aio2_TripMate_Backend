@@ -19,6 +19,7 @@ PLACES_TEXT_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
 PLACES_DETAILS_URL = "https://places.googleapis.com/v1/places"
 ROUTES_COMPUTE_ROUTES_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
 STATIC_MAP_URL = "https://maps.googleapis.com/maps/api/staticmap"
+WEATHER_DAILY_FORECAST_URL = "https://weather.googleapis.com/v1/forecast/days:lookup"
 
 # 검색 카드를 그리고 나중에 최소한의 `places` 행을 만들 때 필요한 필드만 요청한다.
 # 더 많은 필드를 요청하면 Places API 과금 단계가 높아질 수 있다.
@@ -509,6 +510,33 @@ class GoogleMapsClient:
             raise GoogleMapsRequestError(
                 "Google Routes 응답의 경로 형식이 올바르지 않습니다."
             ) from error
+
+    def get_daily_forecast(self, coordinates: Coordinates, *, days: int = 10) -> list[dict]:
+        """좌표 기준으로 오늘부터 최대 10일의 Google 일별 예보를 반환한다."""
+
+        if not 1 <= days <= 10:
+            raise ValueError("날씨 예보 일수는 1에서 10 사이여야 합니다.")
+        query = urlencode(
+            {
+                "key": self._api_key,
+                "location.latitude": coordinates.latitude,
+                "location.longitude": coordinates.longitude,
+                "days": days,
+                "pageSize": days,
+                "languageCode": "ko",
+            }
+        )
+        content, _ = self._request_bytes(
+            Request(f"{WEATHER_DAILY_FORECAST_URL}?{query}", method="GET")
+        )
+        try:
+            response = json.loads(content.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise GoogleMapsRequestError("Google Weather가 JSON 응답을 반환하지 않았습니다.") from error
+        forecasts = response.get("forecastDays") if isinstance(response, dict) else None
+        if not isinstance(forecasts, list):
+            raise GoogleMapsRequestError("Google Weather 예보 형식이 올바르지 않습니다.")
+        return [forecast for forecast in forecasts if isinstance(forecast, dict)]
 
     def build_static_map_request(
         self,
