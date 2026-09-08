@@ -214,7 +214,11 @@ def _schedule_summary(days: list[dict], timezone_name: str = "Asia/Seoul") -> st
 
 
 def _travel_generation_inputs(
-    trip: dict, days: list[dict], history: list[dict], user_message: str
+    trip: dict,
+    days: list[dict],
+    history: list[dict],
+    user_message: str,
+    mate_type: str = "assistant",
 ) -> tuple[str, str, str, list[dict]]:
     """일반 응답과 스트리밍 응답이 공통으로 쓰는 Gemini 입력을 만든다.
 
@@ -229,11 +233,21 @@ def _travel_generation_inputs(
 
     # .env에서 모델을 비워 두면 실습용 기본 모델을 사용한다.
     model = os.getenv("GEMINI_MODEL", "").strip() or "gemini-3.5-flash-lite"
+    mate_guidance = {
+        "assistant": "핵심 내용을 먼저 짧고 명확하게 전달하는 비서처럼 답하세요.",
+        "guide": "여행 가이드처럼 배경 설명과 선택지를 함께 제안하되, 답변은 이해하기 쉽게 정리하세요.",
+        "senior": "어르신도 읽기 쉽도록 쉬운 단어와 짧은 문장을 사용하고, 순서를 나누어 천천히 설명하세요.",
+    }.get(
+        str(mate_type or "assistant"),
+        "핵심 내용을 먼저 짧고 명확하게 전달하는 비서처럼 답하세요.",
+    )
     system_prompt = f"""
 당신은 TripMate의 AI 여행 플래너입니다.
 여행 제목: {trip.get('title')}
 여행지: {trip.get('destination') or '미정'}
 시간대: {trip.get('timezone') or 'Asia/Seoul'}
+현재 Mate 방식:
+{mate_guidance}
 
 현재 저장된 여행 조건:
 {travel_preferences_text(trip)}
@@ -267,11 +281,15 @@ def _travel_generation_inputs(
 
 
 def generate_travel_reply(
-    trip: dict, days: list[dict], history: list[dict], user_message: str
+    trip: dict,
+    days: list[dict],
+    history: list[dict],
+    user_message: str,
+    mate_type: str = "assistant",
 ) -> str:
     """여행 정보, 일정, 최근 대화를 바탕으로 Gemini 답변을 생성한다."""
     api_key, model, system_prompt, contents = _travel_generation_inputs(
-        trip, days, history, user_message
+        trip, days, history, user_message, mate_type
     )
 
     try:
@@ -290,7 +308,11 @@ def generate_travel_reply(
 
 
 def generate_travel_reply_stream(
-    trip: dict, days: list[dict], history: list[dict], user_message: str
+    trip: dict,
+    days: list[dict],
+    history: list[dict],
+    user_message: str,
+    mate_type: str = "assistant",
 ) -> Iterator[str]:
     """Gemini 답변을 완성 전 텍스트 조각 단위로 순서대로 반환한다.
 
@@ -300,7 +322,7 @@ def generate_travel_reply_stream(
     """
 
     api_key, model, system_prompt, contents = _travel_generation_inputs(
-        trip, days, history, user_message
+        trip, days, history, user_message, mate_type
     )
     try:
         client = genai.Client(api_key=api_key)
