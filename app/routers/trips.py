@@ -1,9 +1,12 @@
 import logging
 from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
+from typing import Literal
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.activity_logging import record_activity
@@ -16,6 +19,7 @@ from app.google_maps_client import (
 )
 from app.services.itinerary_generation import generate_daily_itinerary_drafts
 from app.services.itinerary_routing import group_nearby_itinerary_places
+from app.services.itinerary_export import generate_itinerary_images, itinerary_as_text
 from app.services.destination_scope import resolve_destination_scope
 from app.schemas import (
     ItineraryItemCreate,
@@ -28,6 +32,7 @@ from app.schemas import (
     TripPinUpdate,
     TripUpdate,
 )
+from fastapi import APIRouter, Depends, HTTPException, status
 
 router = APIRouter(tags=["trips"])
 LOGGER = logging.getLogger(__name__)
@@ -356,6 +361,36 @@ def _cache_google_place(client, values: dict) -> dict:
     )
 
 
+# 검색어 하나당 Google 에 요청할 후보 수. 도시 검증에서 인접 도시 후보가 빠지는
+# 만큼 여유를 둔다. Places 텍스트 검색의 상한은 20이다.
+_ITINERARY_PLACE_CANDIDATES = 10
+
+
+def _candidate_origin(scope, place) -> dict[str, str]:
+    """검증에 떨어진 후보가 어느 도시 소속인지만 짧게 요약한다.
+
+    Google 응답 전체를 남기지 않으려고 판정에 쓰인 주소 구성요소 이름과 사유만
+    모은다. 좌표·평점·장소 ID 같은 나머지 필드는 기록하지 않는다.
+    """
+
+    def component(kind: str) -> str:
+        return next(
+            (
+                part.long_text or part.short_text
+                for part in place.address_components
+                if kind in part.types
+            ),
+            "",
+        )
+
+    return {
+        "name": place.display_name,
+        "city": component(scope.city_type),
+        "area": component("administrative_area_level_1"),
+        "reason": scope.rejection_reason(place) or "",
+    }
+
+
 def _resolve_initial_itinerary_places(
     client,
     trip_values: dict,
@@ -423,9 +458,13 @@ def _resolve_initial_itinerary_places(
             resolved_rows.append(row)
             continue
         try:
+            # [변경 사유] Google 의 도시 범위는 사각형이라 인접 도시 장소가 함께
+            # 돌아온다. 아래 도시 검증에서 그런 후보를 걸러내므로, 후보가 적으면
+            # 도시 안 장소가 목록에 들지 못해 여행 생성 전체가 막힌다. 후보 수를
+            # 늘려도 Places 텍스트 검색은 요청 단위로 과금되어 호출 수는 그대로다.
             candidates = maps.search_places(
                 full_query,
-                max_results=5,
+                max_results=_ITINERARY_PLACE_CANDIDATES,
                 language_code="ko",
                 location_restriction=destination_scope.viewport,
                 include_region_metadata=True,
@@ -463,6 +502,17 @@ def _resolve_initial_itinerary_places(
             # 인증값·사용자 질문·전체 응답은 기록하지 않고 실패 원인별 개수만 남긴다.
             rejected = Counter(destination_scope.rejection_reason(item) for item in candidates)
             LOGGER.warning("AI 일정 장소 지역 검증 실패: 후보 %d개, 사유 %s", len(candidates), dict(rejected))
+            # [변경 사유] 개수만으로는 '모델이 다른 도시를 추천했다' 와 '주소 표기가
+            # 어긋났다' 를 구분할 수 없어 원인 확인이 불가능했다. 검색어와 후보의
+            # 도시·상위 지역 이름만 DEBUG 로 남긴다. 인증값과 Google 전체 응답은
+            # 그대로 기록하지 않는다.
+            if LOGGER.isEnabledFor(logging.DEBUG):
+                LOGGER.debug(
+                    "AI 일정 장소 지역 검증 실패 상세: 검색어=%r 도시=%r 후보=%s",
+                    full_query,
+                    destination_scope.display_name,
+                    [_candidate_origin(destination_scope, item) for item in candidates],
+                )
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=(
@@ -1631,3 +1681,121 @@ def delete_itinerary_item(
         entity_type="itinerary_item",
         entity_id=item_id,
     )
+
+# =============================================================================
+# 일정표 이미지 다운로드 (SCR-007)
+#
+# 스타일 선택 -> 다운로드 두 단계로 끝난다. 심플형과 일러스트형 모두 LLM 이
+# 그리며, 스타일은 프롬프트만 바꾼다 (services/itinerary_export_prompt.py).
+# =============================================================================
+
+
+def _itinerary_export_zip(trip: dict, images: list[bytes | None]) -> Response:
+    """장별 PNG 를 ZIP 한 개로 묶어 내려보낸다.
+
+    **ZIP 은 전송 형식일 뿐이다.** 사용자는 ZIP 을 저장하지 않는다 - 화면이 풀어서
+    장별 [저장] 버튼을 보여 준다. 장마다 따로 내려받게 하면 8일 여행에서 화면이
+    네 번을 순차로 기다려 타임아웃이 먼저 난다.
+
+    압축하지 않는다(ZIP_STORED). PNG 는 이미 압축돼 있어 다시 압축해도 크기가
+    거의 안 줄고 시간만 든다.
+
+    HTTP 헤더는 latin-1 만 담을 수 있어 한글 파일명을 그대로 넣으면 응답 자체가
+    터진다. RFC 5987 로 UTF-8 이름을 주고, 못 읽는 클라이언트를 위해 ASCII 이름도
+    함께 둔다.
+    """
+
+    import io
+    import zipfile
+    from urllib.parse import quote
+
+    stamp = str(trip.get("start_date") or "").replace("-", "") or "undated"
+    place = str(trip.get("destination") or "trip")
+    total = len(images)
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_STORED) as archive:
+        for page, png in enumerate(images, start=1):
+            # 실패한 장은 건너뛰되 **페이지 번호는 유지한다.** 번호를 다시 매기면
+            # 파일 이름의 2of4 가 실제 순서와 어긋난다.
+            if png is None:
+                continue
+            archive.writestr(f"tripmate_{place}_{stamp}_{page}of{total}.png", png)
+
+    korean = f"tripmate_{place}_{stamp}.zip"
+    ascii_name = f"tripmate_{stamp}.zip"
+    return Response(
+        content=buffer.getvalue(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition":
+                f'attachment; filename="{ascii_name}"; '
+                f"filename*=UTF-8''{quote(korean)}",
+            # 화면이 받은 장수와 기대 장수를 견줄 수 있게 알려 준다.
+            "X-Total-Pages": str(total),
+        },
+    )
+
+
+@router.get("/trips/{trip_id}/itinerary/export")
+def export_itinerary_image(
+    trip_id: UUID,
+    # 기본값을 심플형으로 둔다. 인쇄용이 더 자주 쓰이고, 시안에서도 심플형이
+    # [기본 선택] 이다. Literal 이라 잘못된 값은 FastAPI 가 422 로 먼저 막는다.
+    style: Literal["simple", "illustrated"] = "simple",
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """저장된 일정을 일정표 PNG 로 그려 ZIP 으로 내려보낸다.
+
+    일정이 길면 여러 장으로 나눠 그린다 (services/itinerary_export.DAYS_PER_PAGE).
+    한 장짜리도 같은 ZIP 으로 보낸다 - 화면이 한 갈래로만 처리하게 하려는 것이다.
+    """
+
+    client = get_user_client(current_user.token)
+    # 소유권 확인과 trip/days 로딩을 대시보드와 같은 경로로 처리한다. 여기서
+    # 따로 조회하면 그림이 화면과 다른 일정을 그릴 여지가 생긴다.
+    dashboard = trip_dashboard(client, trip_id)
+    trip, days = dashboard["trip"], dashboard["days"]
+    if not any(day.get("items") for day in days):
+        raise HTTPException(status_code=404, detail="내보낼 일정이 없습니다.")
+
+    images = generate_itinerary_images(trip, days, style)
+    if not any(images):
+        # 한 장도 못 그렸다. 일정 자체는 있으므로 /export/text 로 붙여넣을 수 있는
+        # 텍스트를 받을 수 있다고 알린다.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="지금은 일정표 이미지를 만들 수 없습니다. 일정 텍스트로 저장해 주세요.",
+        )
+
+    drawn = [png for png in images if png]
+    record_activity(
+        client,
+        user_id=current_user.id,
+        event_type="itinerary.export",
+        trip_id=trip_id,
+        # metadata 키 이름 주의 - routers/console.py 가 rating/sentiment/feedback/
+        # pace/intensity/travel_intensity 키를 보고 피드백·페이스 로그로 분류한다.
+        # 그 이름을 쓰면 이 로그가 운영 콘솔 집계에 잘못 섞인다.
+        metadata={
+            "style": style,
+            "format": "zip",
+            "pages": len(images),
+            "drawn_pages": len(drawn),
+            "size_bytes": sum(len(png) for png in drawn),
+        },
+    )
+    return _itinerary_export_zip(trip, images)
+
+
+@router.get("/trips/{trip_id}/itinerary/export/text")
+def export_itinerary_text(
+    trip_id: UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    client = get_user_client(current_user.token)
+    dashboard = trip_dashboard(client, trip_id)
+    trip, days = dashboard["trip"], dashboard["days"]
+    if not any(day.get("items") for day in days):
+        raise HTTPException(status_code=404, detail="내보낼 일정이 없습니다.")
+    return {"text": itinerary_as_text(trip, days)}

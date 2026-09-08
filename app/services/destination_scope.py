@@ -57,6 +57,34 @@ def display_label(place: PlaceResult) -> str:
     return _DISPLAY_LABELS.get(place.google_place_id) or place.display_name
 
 
+def _comparable_forms(value: str) -> tuple[str, ...]:
+    """이름 하나를 대조 가능한 표기들로 편다. 번역은 하지 않는다.
+
+    [변경 사유] 같은 베트남 성인데 Google 이 도시 조회에는 'Khanh Hoa' 를,
+    일부 장소 응답에는 'Khánh Hòa' 를 준다. NFKC 와 casefold 는 발음부호를
+    남기므로 두 값이 다른 지역으로 판정돼 나트랑 여행 생성이 통째로 막혔다.
+    도시 조회는 ko·en 둘 다 ASCII 표기를 주기 때문에 언어별 별칭 보완으로도
+    덮이지 않는다.
+
+    [변경 사유] 발음부호를 떼어 낸 표기는 **원본을 대체하지 않고 함께** 담는다.
+    정확히 일치하던 이름은 그대로 일치하고, 표기 차이만 추가로 흡수한다.
+
+    [변경 사유] 발음부호를 뗀 결과가 ASCII 일 때만 더한다. 라틴 문자 밖에서는
+    같은 처리가 뜻을 바꾼다 — 가나의 탁점을 떼면 'が' 가 'か' 가 되어 서로 다른
+    이름이 같은 이름이 된다. 한자·한글 표기는 애초에 영향을 받지 않는다.
+    """
+    normalized = " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+    if not normalized:
+        return ()
+    folded = "".join(
+        char for char in unicodedata.normalize("NFD", normalized)
+        if not unicodedata.combining(char)
+    )
+    if folded != normalized and folded.isascii():
+        return (normalized, folded)
+    return (normalized,)
+
+
 def _names(place: PlaceResult, component_type: str) -> frozenset[str]:
     """Google의 같은 종류 주소 구성요소에서 긴 이름·짧은 이름만 비교한다.
 
@@ -64,11 +92,11 @@ def _names(place: PlaceResult, component_type: str) -> frozenset[str]:
     있다는 이유로 사카이시까지 '오사카시'로 통과시키지 않기 위한 구분이다.
     """
     return frozenset(
-        normalized
+        form
         for component in place.address_components
         if component_type in component.types
         for value in (component.long_text, component.short_text)
-        if (normalized := " ".join(unicodedata.normalize("NFKC", value).casefold().split()))
+        for form in _comparable_forms(value)
     )
 
 

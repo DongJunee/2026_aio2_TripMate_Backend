@@ -230,6 +230,64 @@ class DestinationScopeTests(unittest.TestCase):
             resolve_destination_scope(maps, "오사카")
 
 
+class DiacriticNotationTests(unittest.TestCase):
+    """같은 지역의 발음부호 표기 차이만 흡수하고 다른 지역은 계속 거절한다."""
+
+    def setUp(self):
+        # Google 실측: 나트랑 도시 조회는 ko·en 모두 'Khanh Hoa' 를 주는데,
+        # 일부 장소 응답은 같은 성을 'Khánh Hòa' 로 준다.
+        # make_place 의 기본 표시 범위는 오사카권이라 나트랑 좌표를 담지 못한다.
+        self.city = replace(
+            make_place(
+                place_id="nha-trang-city", city="Nha Trang", country="VN", admin="Khanh Hoa",
+                latitude=12.2388, longitude=109.1967, is_city=True,
+            ),
+            viewport=GeoViewport(Coordinates(11.0, 108.0), Coordinates(13.0, 110.0)),
+        )
+        self.scope = DestinationScope.from_city(self.city)
+
+    def test_same_area_with_vietnamese_diacritics_is_accepted(self):
+        place = make_place(
+            place_id="nha-trang-beach", city="Nha Trang", country="VN", admin="Khánh Hòa",
+            latitude=12.2388, longitude=109.1967,
+        )
+        self.assertIsNone(self.scope.rejection_reason(place))
+
+    def test_diacritics_on_both_sides_still_match(self):
+        scope = DestinationScope.from_city(replace(
+            self.city,
+            address_components=tuple(
+                AddressComponent("Khánh Hòa", "Khánh Hòa", ("administrative_area_level_1", "political"))
+                if "administrative_area_level_1" in part.types else part
+                for part in self.city.address_components
+            ),
+        ))
+        plain = make_place(
+            place_id="nha-trang-beach", city="Nha Trang", country="VN", admin="Khanh Hoa",
+            latitude=12.2388, longitude=109.1967,
+        )
+        self.assertIsNone(scope.rejection_reason(plain))
+
+    def test_different_city_in_same_area_is_still_rejected(self):
+        # 실측된 '북나트랑' 사례. 성은 같지만 도시가 다르므로 통과하면 안 된다.
+        place = make_place(
+            place_id="bac-nha-trang", city="Bac Nha Trang", country="VN", admin="Khánh Hòa",
+            latitude=12.2388, longitude=109.1967,
+        )
+        self.assertEqual(self.scope.rejection_reason(place), "city_name_mismatch")
+
+    def test_kana_voicing_marks_are_not_folded_away(self):
+        """라틴 문자 밖에서는 같은 처리가 뜻을 바꾸므로 적용하지 않는다."""
+        scope = DestinationScope.from_city(make_place(
+            place_id="kana-city", city="がっこう", country="JP", admin="テスト県", is_city=True,
+        ))
+        # 좌표는 make_place 기본값이라 표시 범위 안에 있고, 이름만 다르다.
+        self.assertEqual(
+            scope.rejection_reason(make_place(city="かっこう", country="JP", admin="テスト県")),
+            "city_name_mismatch",
+        )
+
+
 class DestinationCityAliasTests(unittest.TestCase):
     """Google의 같은 도시 ID에서 확인한 번역만 허용하고 지역 제한을 유지한다."""
 
@@ -399,7 +457,7 @@ class TripScopeRoutingTests(unittest.TestCase):
         maps.search_city.assert_called_once_with("오사카", language_code="ko")
         maps.get_city_details.assert_not_called()
         maps.search_places.assert_called_once_with(
-            "카페 오사카", max_results=5, language_code="ko",
+            "카페 오사카", max_results=trips._ITINERARY_PLACE_CANDIDATES, language_code="ko",
             location_restriction=city.viewport, include_region_metadata=True,
         )
         cache.assert_called_once_with(client, inside.as_place_row())
@@ -441,6 +499,45 @@ class TripScopeRoutingTests(unittest.TestCase):
         client.table.assert_not_called()
         cache.assert_not_called()
         maps.search_places.assert_called()
+
+    def test_rejected_candidates_are_summarised_for_debug_logging(self):
+        """검증 실패 진단 로그가 실패 경로에서 예외를 만들지 않는지 확인한다.
+
+        이 로그는 후보가 전멸했을 때만 실행되므로, 여기서 터지면 422 로 끝났을
+        요청이 500 이 된다. 사유별 개수만으로는 '다른 도시 추천' 과 '주소 표기
+        불일치' 를 구분할 수 없어 이 요약이 원인 확인의 유일한 근거다.
+        """
+        scope = DestinationScope.from_city(make_place(place_id="osaka-city", is_city=True))
+        kyoto = make_place(
+            place_id="kyoto-cafe", city="Kyoto", admin="Kyoto Prefecture",
+            latitude=35.0116, longitude=135.7681,
+        )
+        summary = trips._candidate_origin(scope, kyoto)
+        self.assertEqual(summary["city"], "Kyoto")
+        self.assertEqual(summary["area"], "Kyoto Prefecture")
+        self.assertEqual(summary["reason"], "city_name_mismatch")
+        self.assertEqual(summary["name"], kyoto.display_name)
+
+    def test_debug_logging_runs_when_every_candidate_is_rejected(self):
+        maps = MagicMock(spec=GoogleMapsClient)
+        maps.search_city.return_value = [make_place(place_id="osaka-city", is_city=True)]
+        maps.get_city_details.return_value = make_place(place_id="osaka-city", is_city=True)
+        maps.search_places.return_value = [make_place(
+            place_id="kyoto-cafe", city="Kyoto", admin="Kyoto Prefecture",
+            latitude=35.0116, longitude=135.7681,
+        )]
+        with (
+            patch.object(trips.GoogleMapsClient, "from_environment", return_value=maps),
+            patch.object(trips, "_cache_google_place") as cache,
+            self.assertLogs(trips.LOGGER, level="DEBUG") as logs,
+            self.assertRaises(HTTPException) as raised,
+        ):
+            trips._resolve_initial_itinerary_places(
+                MagicMock(), {"destination": "오사카"}, [{"_place_query": "카페", "item_type": "cafe"}],
+            )
+        self.assertEqual(raised.exception.status_code, 422)
+        self.assertTrue(any("검색어=" in line and "city_name_mismatch" in line for line in logs.output))
+        cache.assert_not_called()
 
     def test_fukuoka_alias_is_loaded_once_and_reused_for_later_queries(self):
         maps = MagicMock(spec=GoogleMapsClient)

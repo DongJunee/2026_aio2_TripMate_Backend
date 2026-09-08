@@ -43,14 +43,17 @@ def update_profile(
     payload: ProfileUpdate,
     current_user: CurrentUser = Depends(get_current_user),
 ):
-    """로그인한 사용자의 표시용 사용자 이름을 변경한다."""
+    """로그인한 사용자의 표시 이름 또는 Mate 대화 방식을 변경한다."""
 
     # ID는 클라이언트 입력이 아니라 검증된 Bearer 토큰에서만 가져온다.
     client = get_user_client(current_user.token)
+    # 실제로 저장하는 값과 로그에 남기는 필드 이름을 같은 dict에서 가져온다.
+    # 두 곳에 따로 적어 두면 mate_type만 바꿔도 username으로 기록되는 식으로
+    # 어긋난다.
+    values = payload.model_dump(exclude_none=True)
     result = (
         client.table("profiles")
-        #.update({"username": payload.username})
-        .update(payload.model_dump(exclude_none=True))
+        .update(values)
         .eq("id", current_user.id)
         .execute()
     )
@@ -62,7 +65,7 @@ def update_profile(
         event_type="profile.update",
         entity_type="profile",
         entity_id=current_user.id,
-        metadata={"fields": ["username"]},
+        metadata={"fields": sorted(values)},
     )
     return result.data[0]
 

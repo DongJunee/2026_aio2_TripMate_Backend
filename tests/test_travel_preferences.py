@@ -107,7 +107,7 @@ class TravelPreferenceTests(unittest.TestCase):
             resolve_scope.return_value.accepts.return_value = True
             resolved = trips._resolve_initial_itinerary_places(client, {"destination": "도쿄"}, rows)
         maps.search_places.assert_called_once_with(
-            "시내 카페 도쿄", max_results=5, language_code="ko",
+            "시내 카페 도쿄", max_results=trips._ITINERARY_PLACE_CANDIDATES, language_code="ko",
             location_restriction=resolve_scope.return_value.viewport, include_region_metadata=True,
         )
         cache.assert_called_once()
