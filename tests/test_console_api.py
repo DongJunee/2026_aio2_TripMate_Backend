@@ -1,4 +1,3 @@
-import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -7,6 +6,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.routers.console import router
+from app.deps import CurrentUser, get_current_user
 
 
 class FakeQuery:
@@ -23,6 +23,9 @@ class FakeQuery:
         return self
 
     def range(self, *_args):
+        return self
+
+    def eq(self, *_args):
         return self
 
     def execute(self):
@@ -99,14 +102,19 @@ class ConsoleApiTests(unittest.TestCase):
         self.app = FastAPI()
         self.app.include_router(router)
         self.client = FakeClient()
+        self.auth_client = FakeClient()
+        self.auth_client.tables["profiles"][0]["is_admin"] = True
+        self.app.dependency_overrides[get_current_user] = lambda: CurrentUser(
+            id="user-1", email="dongjun@gmail.com", token="test-user-token"
+        )
 
-    @patch.dict(os.environ, {"DASHBOARD_ADMIN_TOKEN": "test-admin-token"}, clear=False)
     @patch("app.routers.console.get_service_client")
-    def test_user_list_supports_search_and_counts(self, get_client):
+    @patch("app.routers.dashboard.get_user_client")
+    def test_user_list_supports_search_and_counts(self, get_user_client, get_client):
         get_client.return_value = self.client
+        get_user_client.return_value = self.auth_client
         response = TestClient(self.app).get(
             "/admin/console/users?search=dongjun",
-            headers={"X-Admin-Token": "test-admin-token"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -116,13 +124,13 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertEqual(payload["items"][0]["trip_count"], 1)
         self.assertEqual(payload["items"][0]["request_count"], 1)
 
-    @patch.dict(os.environ, {"DASHBOARD_ADMIN_TOKEN": "test-admin-token"}, clear=False)
     @patch("app.routers.console.get_service_client")
-    def test_user_detail_returns_trips_and_logs(self, get_client):
+    @patch("app.routers.dashboard.get_user_client")
+    def test_user_detail_returns_trips_and_logs(self, get_user_client, get_client):
         get_client.return_value = self.client
+        get_user_client.return_value = self.auth_client
         response = TestClient(self.app).get(
             "/admin/console/users/user-1",
-            headers={"X-Admin-Token": "test-admin-token"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -131,13 +139,13 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertEqual(payload["recent_requests"][0]["endpoint"], "/me")
         self.assertEqual(payload["recent_activities"][0]["event_type"], "trip.create")
 
-    @patch.dict(os.environ, {"DASHBOARD_ADMIN_TOKEN": "test-admin-token"}, clear=False)
     @patch("app.routers.console.get_service_client")
-    def test_feedback_returns_aggregate_only(self, get_client):
+    @patch("app.routers.dashboard.get_user_client")
+    def test_feedback_returns_aggregate_only(self, get_user_client, get_client):
         get_client.return_value = self.client
+        get_user_client.return_value = self.auth_client
         response = TestClient(self.app).get(
             "/admin/console/feedback",
-            headers={"X-Admin-Token": "test-admin-token"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -147,13 +155,13 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertEqual(payload["pace_count"], 1)
         self.assertNotIn("metadata", payload)
 
-    @patch.dict(os.environ, {"DASHBOARD_ADMIN_TOKEN": "test-admin-token"}, clear=False)
     @patch("app.routers.console.get_service_client")
-    def test_system_status_uses_recent_request_window_shape(self, get_client):
+    @patch("app.routers.dashboard.get_user_client")
+    def test_system_status_uses_recent_request_window_shape(self, get_user_client, get_client):
         get_client.return_value = self.client
+        get_user_client.return_value = self.auth_client
         response = TestClient(self.app).get(
             "/admin/console/system-status",
-            headers={"X-Admin-Token": "test-admin-token"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -162,8 +170,8 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertEqual(len(payload["services"]), 4)
         self.assertTrue(any(item["request_count"] == 1 for item in payload["services"]))
 
-    @patch.dict(os.environ, {"DASHBOARD_AUTH_DISABLED": "false"}, clear=False)
-    def test_missing_admin_token_is_rejected(self):
+    def test_missing_login_is_rejected(self):
+        self.app.dependency_overrides.clear()
         response = TestClient(self.app).get("/admin/console/users")
         self.assertEqual(response.status_code, 401)
 

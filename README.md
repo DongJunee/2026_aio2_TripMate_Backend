@@ -20,12 +20,12 @@ backend calls.
    this same key value through its own `GOOGLE_MAPS_API_KEY` secret.
 3. Redis is optional. Leave all Redis values blank to run without caching.
 
-During local dashboard testing, `DASHBOARD_AUTH_DISABLED=true` allows the
-dashboard endpoints to be called by a logged-in session. Set it to `false` or
-remove it before sharing or deploying the backend. In production, list allowed
-administrator emails in `DASHBOARD_ADMIN_EMAILS` as a comma-separated value.
-The frontend uses the current login session and does not receive
-`DASHBOARD_ADMIN_TOKEN`.
+Dashboard access is controlled by `public.profiles.is_admin`, not by an
+environment variable. Run `supabase/20260908_profile_admin.sql` once in the
+team Supabase SQL Editor, then set `is_admin = true` for the administrator's
+profile. The logged-in frontend session is used for every dashboard request;
+no dashboard token, administrator email list, or auth-disabled environment
+variable is required.
 
 ## Run
 

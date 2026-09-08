@@ -1,4 +1,3 @@
-import os
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
@@ -7,6 +6,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.routers.dashboard import router
+from app.deps import CurrentUser, get_current_user
 
 
 class FakeQuery:
@@ -23,6 +23,9 @@ class FakeQuery:
         return self
 
     def range(self, *_args):
+        return self
+
+    def eq(self, *_args):
         return self
 
     def execute(self):
@@ -75,15 +78,17 @@ class DashboardApiTests(unittest.TestCase):
                 ],
             }
         )
+        self.auth_client = FakeClient({"profiles": [{"id": "admin-1", "is_admin": True}]})
+        self.app.dependency_overrides[get_current_user] = lambda: CurrentUser(
+            id="admin-1", email="admin@example.com", token="test-user-token"
+        )
 
-    def headers(self):
-        return {"X-Admin-Token": "test-admin-token"}
-
-    @patch.dict(os.environ, {"DASHBOARD_ADMIN_TOKEN": "test-admin-token"}, clear=False)
     @patch("app.routers.dashboard.get_service_client")
-    def test_summary_returns_kpis_and_endpoint_stats(self, get_client):
+    @patch("app.routers.dashboard.get_user_client")
+    def test_summary_returns_kpis_and_endpoint_stats(self, get_user_client, get_client):
         get_client.return_value = self.client
-        response = TestClient(self.app).get("/admin/dashboard/summary", headers=self.headers())
+        get_user_client.return_value = self.auth_client
+        response = TestClient(self.app).get("/admin/dashboard/summary")
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
@@ -94,37 +99,33 @@ class DashboardApiTests(unittest.TestCase):
         self.assertEqual(payload["kpis"]["error_rate_percent"], 50.0)
         self.assertEqual(payload["endpoint_usage"][0]["endpoint"], "/health")
 
-    @patch.dict(os.environ, {"DASHBOARD_ADMIN_TOKEN": "test-admin-token"}, clear=False)
     @patch("app.routers.dashboard.get_service_client")
-    def test_errors_returns_recent_failures(self, get_client):
+    @patch("app.routers.dashboard.get_user_client")
+    def test_errors_returns_recent_failures(self, get_user_client, get_client):
         get_client.return_value = self.client
-        response = TestClient(self.app).get("/admin/dashboard/errors", headers=self.headers())
+        get_user_client.return_value = self.auth_client
+        response = TestClient(self.app).get("/admin/dashboard/errors")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["count"], 1)
         self.assertEqual(response.json()["items"][0]["status_code"], 500)
 
-    @patch.dict(
-        os.environ,
-        {"DASHBOARD_ADMIN_TOKEN": "test-admin-token", "DASHBOARD_AUTH_DISABLED": "false"},
-        clear=False,
-    )
-    def test_missing_admin_token_is_rejected(self):
+    def test_missing_login_is_rejected(self):
+        self.app.dependency_overrides.clear()
         response = TestClient(self.app).get("/admin/dashboard/summary")
 
         self.assertEqual(response.status_code, 401)
 
-    @patch.dict(
-        os.environ,
-        {"DASHBOARD_AUTH_DISABLED": "true"},
-        clear=False,
-    )
+    @patch("app.routers.dashboard.get_user_client")
     @patch("app.routers.dashboard.get_service_client")
-    def test_test_mode_allows_access_without_admin_token(self, get_client):
+    def test_non_admin_profile_is_rejected(self, get_client, get_user_client):
         get_client.return_value = self.client
+        get_user_client.return_value = FakeClient(
+            {"profiles": [{"id": "admin-1", "is_admin": False}]}
+        )
         response = TestClient(self.app).get("/admin/dashboard/summary")
 
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 403)
 
 
 if __name__ == "__main__":

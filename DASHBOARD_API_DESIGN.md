@@ -45,14 +45,9 @@
 
 ### 관리자 인증
 
-프론트엔드는 관리자용 토큰을 `X-Admin-Token` 헤더로 전달한다.
-
-```http
-X-Admin-Token: <DASHBOARD_ADMIN_TOKEN>
-```
-
-`DASHBOARD_ADMIN_TOKEN`의 실제 값은 프론트엔드에 넣지 않고 백엔드 환경변수에만 둔다.
-백엔드는 토큰을 확인한 뒤 service-role Supabase 클라이언트로 로그를 조회한다.
+프론트엔드는 현재 로그인 세션의 Bearer 토큰을 전달한다.
+백엔드는 해당 사용자의 `public.profiles.is_admin` 값을 확인한 뒤
+관리자일 때만 service-role Supabase 클라이언트로 로그를 조회한다.
 
 ### 기간 파라미터
 
@@ -219,13 +214,10 @@ Supabase SQL Editor에서 원본 데이터를 점검하거나 나중에 DB 집�
 동작한다. 로그인 후 사이드바에서 `운영 대시보드`를 선택하면 현재 로그인 세션의
 Bearer 토큰으로 위 API를 호출하고, `여행 화면`을 선택하면 기존 일정 화면으로 돌아간다.
 
-운영 환경에서는 백엔드의 `DASHBOARD_AUTH_DISABLED=false`를 사용하고,
-`DASHBOARD_ADMIN_EMAILS`에 허용할 관리자 이메일을 쉼표로 구분해 등록한다.
-`DASHBOARD_ADMIN_TOKEN`은 기존 API 호환을 위해 백엔드에서만 사용할 수 있으며
-프론트엔드에 전달하지 않는다.
-
-로컬 테스트 기간에는 백엔드 환경변수 `DASHBOARD_AUTH_DISABLED=true`로 관리자 인증을
-임시 해제할 수 있다. 배포나 공유 전에는 반드시 `false`로 바꾸거나 해당 설정을 제거한다.
+관리자 권한은 `supabase/20260908_profile_admin.sql` 마이그레이션으로 추가되는
+`public.profiles.is_admin` boolean 컬럼으로 관리한다. 관리자 프로필에만
+`is_admin = true`를 부여하며, 관리자 토큰·관리자 이메일 목록·인증 우회 환경변수는
+사용하지 않는다.
 
 ## 8. 현재 구현 상태
 

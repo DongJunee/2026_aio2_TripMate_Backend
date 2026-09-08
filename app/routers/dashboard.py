@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import os
-import secrets
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
-from fastapi.security import HTTPAuthorizationCredentials
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.dashboard_schemas import (
     DashboardKpis,
@@ -21,8 +18,8 @@ from app.dashboard_schemas import (
     LlmSummaryStat,
 )
 from app.dashboard_auth import is_dashboard_admin
-from app.db import get_service_client
-from app.deps import bearer_scheme, get_current_user
+from app.db import get_service_client, get_user_client
+from app.deps import CurrentUser, get_current_user
 
 router = APIRouter(prefix="/admin/dashboard", tags=["admin-dashboard"])
 KST = ZoneInfo("Asia/Seoul")
@@ -34,38 +31,31 @@ LOG_COLUMNS = (
 
 
 def require_dashboard_admin(
-    request: Request,
-    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
-    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    current_user: CurrentUser = Depends(get_current_user),
 ) -> None:
-    """관리자 토큰을 확인한다. 실제 토큰은 백엔드 환경변수에만 둔다."""
-    if os.getenv("DASHBOARD_AUTH_DISABLED", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
-        return
-
-    if credentials is not None:
-        try:
-            current_user = get_current_user(request, credentials)
-        except HTTPException:
-            current_user = None
-        if current_user and is_dashboard_admin(current_user.email):
-            return
-
-    configured = os.getenv("DASHBOARD_ADMIN_TOKEN", "").strip()
-    if not configured:
+    """로그인한 사용자의 Supabase 프로필에서 관리자 권한을 확인한다."""
+    try:
+        result = (
+            get_user_client(current_user.token)
+            .table("profiles")
+            .select("is_admin")
+            .eq("id", current_user.id)
+            .execute()
+        )
+    except Exception as error:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="대시보드 관리자 토큰이 백엔드에 설정되지 않았습니다.",
-        )
-    if not x_admin_token or not secrets.compare_digest(x_admin_token, configured):
+            detail="관리자 권한을 확인할 수 없습니다.",
+        ) from error
+
+    profile = result.data[0] if result.data else None
+    if not is_dashboard_admin(profile):
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="대시보드 관리자 인증이 필요합니다.",
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="관리자 권한이 필요합니다.",
         )
+
+    return
 
 
 def _normalise_datetime(value: datetime | None, *, default: datetime) -> datetime:

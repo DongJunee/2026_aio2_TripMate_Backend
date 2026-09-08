@@ -16,7 +16,7 @@
 - method: `GET`
 - 현재 로그인 세션의 Bearer 토큰을 사용한다.
 - 백엔드의 관리자 권한 정책은 대시보드와 공유한다.
-- 테스트 중에는 `DASHBOARD_AUTH_DISABLED=true`를 사용할 수 있다.
+- `public.profiles.is_admin = true`인 로그인 사용자만 접근할 수 있다.
 
 ## 사용자 목록
 

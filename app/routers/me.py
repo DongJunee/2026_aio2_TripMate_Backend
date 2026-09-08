@@ -34,7 +34,7 @@ def read_me(current_user: CurrentUser = Depends(get_current_user)):
         "id": current_user.id,
         "email": current_user.email,
         "profile": profile,
-        "is_dashboard_admin": is_dashboard_admin(current_user.email),
+        "is_dashboard_admin": is_dashboard_admin(profile),
     }
 
 
