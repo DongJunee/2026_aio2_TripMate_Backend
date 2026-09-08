@@ -48,10 +48,29 @@ class MessageResponse(BaseModel):
     message: str
 
 
-class ProfileUpdate(BaseModel):
-    """현재 사용자의 표시 이름을 변경할 때 쓰는 입력값이다."""
+MateType = Literal["assistant", "guide", "senior"]
 
-    username: str = Field(min_length=1, max_length=30)
+
+class ProfileUpdate(BaseModel):
+    """현재 사용자의 표시 이름과 Mate 대화 방식을 변경할 때 쓰는 입력값이다."""
+
+    username: str | None = Field(default=None, min_length=1, max_length=30)
+    mate_type: MateType | None = None
+
+    @model_validator(mode="after")
+    def validate_any_change(self):
+        """빈 PATCH 요청으로 프로필을 갱신하지 못하게 한다."""
+
+        if self.username is None and self.mate_type is None:
+            raise ValueError("변경할 프로필 정보를 입력하세요.")
+        return self
+
+
+class PasswordChangeRequest(BaseModel):
+    """로그인 중인 사용자가 현재 비밀번호 확인 뒤 새 비밀번호를 정할 때 쓰는 값이다."""
+
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=6, max_length=128)
 
 
 TravelParty = Literal[

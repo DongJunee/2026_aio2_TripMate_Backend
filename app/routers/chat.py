@@ -60,6 +60,7 @@ def _stream_answer(
     dashboard: dict,
     history: list[dict],
     user_message: str,
+    mate_type: str,
 ) -> StreamingResponse:
     """여행 AI 답변을 SSE로 보내고, 성공한 전체 답변만 DB에 저장한다.
 
@@ -74,7 +75,7 @@ def _stream_answer(
         full_text = ""
         try:
             for text in generate_travel_reply_stream(
-                dashboard["trip"], dashboard["days"], history, user_message
+                dashboard["trip"], dashboard["days"], history, user_message, mate_type
             ):
                 full_text += text
                 yield _sse_event({"text": text})
@@ -171,6 +172,10 @@ def chat(
     # `_messages`는 데이터베이스 쓰기나 Gemini 호출보다 먼저 여행 접근 권한을 확인한다.
     history = _messages(client, trip_id)
     dashboard = trip_dashboard(client, trip_id)
+    profile_result = client.table("profiles").select("mate_type").eq("id", current_user.id).execute()
+    profile = profile_result.data[0] if profile_result.data else {}
+    # SQL 반영 전이거나 기존 프로필에 값이 없으면 기존과 같은 비서 방식으로 답한다.
+    mate_type = str(profile.get("mate_type") or "assistant")
 
     user_message = (
         client.table("messages")
@@ -218,4 +223,24 @@ def chat(
         LOGGER.warning("AI 일정 순서 변경 해석 실패 (%s).", type(error).__name__)
 
     # 이 지점부터 오류는 이미 열린 SSE 스트림 안에서 전달한다.
-    return _stream_answer(client, trip_id, dashboard, history, payload.content)
+    return _stream_answer(client, trip_id, dashboard, history, payload.content, mate_type)
+
+@router.post("/trips/{trip_id}/chat/reset-context")
+def delete_chat_history(
+    trip_id: UUID = Depends(require_own_trip),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """로그인한 사용자의 해당 여행 채팅 기록을 DB와 캐시에서 모두 삭제한다."""
+
+    client = get_user_client(current_user.token)
+    # require_own_trip가 먼저 소유권을 확인하고, RLS도 본인 여행의 메시지만
+    # 삭제하도록 한 번 더 제한한다. 일정·여행 정보는 이 요청으로 삭제하지 않는다.
+    (
+        client.table("messages")
+        .delete()
+        .eq("trip_id", str(trip_id))
+        .execute()
+    )
+    cache_delete(_cache_key(trip_id))
+    touch_trip(client, trip_id)
+    return {"detail": "대화 기록을 모두 삭제했습니다."}
