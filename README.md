@@ -21,8 +21,11 @@ backend calls.
 3. Redis is optional. Leave all Redis values blank to run without caching.
 
 During local dashboard testing, `DASHBOARD_AUTH_DISABLED=true` allows the
-dashboard endpoints to be called without an admin token. Set it to `false` or
-remove it before sharing or deploying the backend.
+dashboard endpoints to be called by a logged-in session. Set it to `false` or
+remove it before sharing or deploying the backend. In production, list allowed
+administrator emails in `DASHBOARD_ADMIN_EMAILS` as a comma-separated value.
+The frontend uses the current login session and does not receive
+`DASHBOARD_ADMIN_TOKEN`.
 
 ## Run
 
@@ -46,6 +49,7 @@ Open <http://127.0.0.1:8000/docs> to test the API.
 - Gemini travel-planner response streamed to the chat screen when `GEMINI_API_KEY` is configured
 - backend-only Google Places (New) search, selected-place persistence, and
   Google Routes path/duration for the interactive browser map
+- administrator dashboard summary and operations-console user/trip log lookup
 
 The backend retains an optional Maps Static API image proxy for a standard
 billed key, but the Streamlit screen now uses Maps JavaScript API so local

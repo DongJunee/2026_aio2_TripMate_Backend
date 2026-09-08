@@ -7,7 +7,8 @@ from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from fastapi.security import HTTPAuthorizationCredentials
 
 from app.dashboard_schemas import (
     DashboardKpis,
@@ -19,7 +20,9 @@ from app.dashboard_schemas import (
     HourlyRequestStat,
     LlmSummaryStat,
 )
+from app.dashboard_auth import is_dashboard_admin
 from app.db import get_service_client
+from app.deps import bearer_scheme, get_current_user
 
 router = APIRouter(prefix="/admin/dashboard", tags=["admin-dashboard"])
 KST = ZoneInfo("Asia/Seoul")
@@ -31,7 +34,9 @@ LOG_COLUMNS = (
 
 
 def require_dashboard_admin(
+    request: Request,
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
 ) -> None:
     """관리자 토큰을 확인한다. 실제 토큰은 백엔드 환경변수에만 둔다."""
     if os.getenv("DASHBOARD_AUTH_DISABLED", "").strip().lower() in {
@@ -41,6 +46,15 @@ def require_dashboard_admin(
         "on",
     }:
         return
+
+    if credentials is not None:
+        try:
+            current_user = get_current_user(request, credentials)
+        except HTTPException:
+            current_user = None
+        if current_user and is_dashboard_admin(current_user.email):
+            return
+
     configured = os.getenv("DASHBOARD_ADMIN_TOKEN", "").strip()
     if not configured:
         raise HTTPException(

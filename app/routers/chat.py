@@ -5,6 +5,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
+from app.activity_logging import record_activity
 from app.cache import cache_delete, cache_get, cache_set
 from app.db import get_user_client
 from app.deps import CurrentUser, get_current_user, require_own_trip
@@ -175,6 +176,15 @@ def chat(
         client.table("messages")
         .insert({"trip_id": str(trip_id), "role": "user", "content": payload.content})
         .execute()
+    )
+    record_activity(
+        client,
+        user_id=current_user.id,
+        event_type="chat.send",
+        trip_id=trip_id,
+        entity_type="message",
+        entity_id=user_message.data[0].get("id") if user_message.data else None,
+        metadata={"message_length": len(payload.content)},
     )
     # 방금 저장한 사용자 메시지가 기록을 바꾸므로 즉시 캐시를 무효화한다.
     cache_delete(_cache_key(trip_id))

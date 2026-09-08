@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
+from app.activity_logging import record_activity
 from app.db import get_user_client
 from app.deps import CurrentUser, get_current_user
 from app.google_maps_client import (
@@ -806,6 +807,15 @@ def create_my_trip(
 
     dashboard = trip_dashboard(client, trip["id"])
     dashboard["initial_itinerary_count"] = len(resolved_drafts)
+    record_activity(
+        client,
+        user_id=current_user.id,
+        event_type="trip.create",
+        trip_id=trip["id"],
+        entity_type="trip",
+        entity_id=trip["id"],
+        metadata={"destination": trip.get("destination"), "day_count": len(days)},
+    )
     return dashboard
 
 
@@ -868,6 +878,15 @@ def update_trip_pin(
             _pinned_trips_for_user(client, current_user.id),
         )
 
+    record_activity(
+        client,
+        user_id=current_user.id,
+        event_type="trip.pin" if payload.pinned else "trip.unpin",
+        trip_id=trip_id,
+        entity_type="trip",
+        entity_id=trip_id,
+        metadata={"pinned": payload.pinned},
+    )
     return _owned_trip(client, trip_id)
 
 
@@ -928,6 +947,18 @@ def update_trip_dates(
     )
     if not result.data:
         raise HTTPException(status_code=404, detail="여행을 찾을 수 없습니다.")
+    record_activity(
+        client,
+        user_id=current_user.id,
+        event_type="trip.dates_update",
+        trip_id=trip_id,
+        entity_type="trip",
+        entity_id=trip_id,
+        metadata={
+            "start_date": payload.start_date.isoformat(),
+            "end_date": payload.end_date.isoformat(),
+        },
+    )
     return trip_dashboard(client, trip_id)
 
 
@@ -940,6 +971,14 @@ def delete_trip(
 
     client = get_user_client(current_user.token)
     _owned_trip(client, trip_id)
+    record_activity(
+        client,
+        user_id=current_user.id,
+        event_type="trip.delete",
+        trip_id=trip_id,
+        entity_type="trip",
+        entity_id=trip_id,
+    )
     client.table("trips").delete().eq("id", str(trip_id)).execute()
 
 
@@ -957,6 +996,15 @@ def create_trip_day(
     values["trip_id"] = str(trip_id)
     result = client.table("trip_days").insert(values).execute()
     touch_trip(client, trip_id)
+    record_activity(
+        client,
+        user_id=current_user.id,
+        event_type="itinerary.day_create",
+        trip_id=trip_id,
+        entity_type="trip_day",
+        entity_id=result.data[0].get("id") if result.data else None,
+        metadata={"day_number": values.get("day_number")},
+    )
     return result.data[0]
 
 
@@ -990,6 +1038,15 @@ def create_itinerary_item(
     if not result.data:
         raise HTTPException(status_code=400, detail="일정을 추가하지 못했습니다.")
     touch_trip(client, trip_id)
+    record_activity(
+        client,
+        user_id=current_user.id,
+        event_type="itinerary.item_create",
+        trip_id=trip_id,
+        entity_type="itinerary_item",
+        entity_id=result.data[0].get("id"),
+        metadata={"item_type": values.get("item_type")},
+    )
     return result.data[0]
 
 
@@ -1021,6 +1078,15 @@ def update_itinerary_item(
         return existing.data[0]
     result = client.table("itinerary_items").update(values).eq("id", str(item_id)).execute()
     touch_trip(client, trip_id)
+    record_activity(
+        client,
+        user_id=current_user.id,
+        event_type="itinerary.item_update",
+        trip_id=trip_id,
+        entity_type="itinerary_item",
+        entity_id=item_id,
+        metadata={"fields": sorted(values)},
+    )
     return result.data[0]
 
 
@@ -1111,6 +1177,18 @@ def update_itinerary_item_time(
         raise HTTPException(status_code=500, detail="일정 시간을 변경하지 못했습니다.") from error
 
     touch_trip(client, trip_id)
+    record_activity(
+        client,
+        user_id=current_user.id,
+        event_type="itinerary.time_change",
+        trip_id=trip_id,
+        entity_type="itinerary_item",
+        entity_id=item_id,
+        metadata={
+            "start_time": payload.start_time.isoformat(),
+            "end_time": payload.end_time.isoformat(),
+        },
+    )
     return {"item": changed, "change": _change_status(change_log, trip.get("timezone"))}
 
 
@@ -1313,6 +1391,15 @@ def swap_itinerary_item_place(
         raise HTTPException(status_code=500, detail="일정 순서를 변경하지 못했습니다.") from error
 
     touch_trip(client, trip_id)
+    record_activity(
+        client,
+        user_id=current_user.id,
+        event_type="itinerary.place_swap",
+        trip_id=trip_id,
+        entity_type="itinerary_item",
+        entity_id=item_id,
+        metadata={"direction": payload.direction},
+    )
     return {"items": changed_items, "change": _change_status(change_log, trip.get("timezone"))}
 
 
@@ -1487,6 +1574,15 @@ def undo_itinerary_change(
         raise HTTPException(status_code=500, detail="일정 변경을 취소하지 못했습니다.") from error
 
     touch_trip(client, trip_id)
+    record_activity(
+        client,
+        user_id=current_user.id,
+        event_type="itinerary.undo",
+        trip_id=trip_id,
+        entity_type="itinerary_change_log",
+        entity_id=log_id,
+        metadata={"source_log_id": str(source_log["id"])},
+    )
     return {"change": _change_status(undo_log, trip.get("timezone"))}
 
 
@@ -1512,3 +1608,11 @@ def delete_itinerary_item(
     if not result.data:
         raise HTTPException(status_code=404, detail="일정을 찾을 수 없습니다.")
     touch_trip(client, trip_id)
+    record_activity(
+        client,
+        user_id=current_user.id,
+        event_type="itinerary.item_delete",
+        trip_id=trip_id,
+        entity_type="itinerary_item",
+        entity_id=item_id,
+    )

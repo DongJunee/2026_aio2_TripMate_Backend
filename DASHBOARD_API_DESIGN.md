@@ -184,6 +184,12 @@ GET /admin/dashboard/errors
 - 오류 목록: 실패 조건에 해당하는 최신 로그부터 최대 100건
 - LLM 요약: `model`이 기록된 요청만 집계
 
+현재 운영 API의 집계 방식은 **백엔드 Python 집계**로 확정했다. 기존 테이블을
+변경하지 않고 바로 적용할 수 있고, 기간 필터와 오류 TOP 3를 한 번에 처리할 수
+있기 때문이다. `supabase/20260907_dashboard_logs_merged.sql` 안의 운영 조회 SQL은
+Supabase SQL Editor에서 원본 데이터를 점검하거나 나중에 DB 집계 함수로 전환할 때
+사용한다.
+
 ## 6. 오류 응답
 
 ```json
@@ -208,8 +214,15 @@ GET /admin/dashboard/errors
 6. `GET /admin/dashboard/errors`를 호출해 최근 오류 테이블에 표시한다.
 7. 날짜를 바꾸면 두 API를 같은 기간으로 다시 호출한다.
 
-프론트엔드는 `SUPABASE_SERVICE_ROLE_KEY`를 사용하지 않는다. 관리자 토큰도 프론트엔드 코드에
-하드코딩하지 않고, 운영 환경의 안전한 비밀 설정으로 전달한다.
+프론트엔드는 `SUPABASE_SERVICE_ROLE_KEY`를 사용하지 않는다. 현재 대시보드는 별도
+`admin_dashboard.py` 호스트가 아니라 기존 `streamlit_app.py`의 로그인 세션 안에서
+동작한다. 로그인 후 사이드바에서 `운영 대시보드`를 선택하면 현재 로그인 세션의
+Bearer 토큰으로 위 API를 호출하고, `여행 화면`을 선택하면 기존 일정 화면으로 돌아간다.
+
+운영 환경에서는 백엔드의 `DASHBOARD_AUTH_DISABLED=false`를 사용하고,
+`DASHBOARD_ADMIN_EMAILS`에 허용할 관리자 이메일을 쉼표로 구분해 등록한다.
+`DASHBOARD_ADMIN_TOKEN`은 기존 API 호환을 위해 백엔드에서만 사용할 수 있으며
+프론트엔드에 전달하지 않는다.
 
 로컬 테스트 기간에는 백엔드 환경변수 `DASHBOARD_AUTH_DISABLED=true`로 관리자 인증을
 임시 해제할 수 있다. 배포나 공유 전에는 반드시 `false`로 바꾸거나 해당 설정을 제거한다.
@@ -221,6 +234,6 @@ GET /admin/dashboard/errors
 - `/docs`·`/redoc`·`/openapi.json`: 운영 로그에서 제외
 - `/docs`의 `Try it out`으로 실행한 실제 API 요청: 로그 기록 대상
 - 관리자 대시보드 조회 API: 백엔드 구현 완료(`/summary`, `/endpoints`, `/errors`)
-- Streamlit 관리자 대시보드 화면: 별도 `admin_dashboard.py`로 연결 완료
+- Streamlit 관리자 대시보드 화면: 기존 `streamlit_app.py` 안에 통합 완료
 
 이 문서는 API 조회 규칙을 정의하는 문서이며, 문서 자체를 실행해 테이블을 변경하지 않는다.

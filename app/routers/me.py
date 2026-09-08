@@ -1,6 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException
 
+from app.activity_logging import record_activity
 from app.db import get_user_client
+from app.dashboard_auth import is_dashboard_admin
 from app.deps import CurrentUser, get_current_user
 from app.schemas import ProfileUpdate
 
@@ -15,7 +17,12 @@ def read_me(current_user: CurrentUser = Depends(get_current_user)):
     client = get_user_client(current_user.token)
     result = client.table("profiles").select("*").eq("id", current_user.id).execute()
     profile = result.data[0] if result.data else None
-    return {"id": current_user.id, "email": current_user.email, "profile": profile}
+    return {
+        "id": current_user.id,
+        "email": current_user.email,
+        "profile": profile,
+        "is_dashboard_admin": is_dashboard_admin(current_user.email),
+    }
 
 
 @router.patch("/profile")
@@ -35,4 +42,12 @@ def update_profile(
     )
     if not result.data:
         raise HTTPException(status_code=404, detail="프로필을 찾을 수 없습니다.")
+    record_activity(
+        client,
+        user_id=current_user.id,
+        event_type="profile.update",
+        entity_type="profile",
+        entity_id=current_user.id,
+        metadata={"fields": ["username"]},
+    )
     return result.data[0]
