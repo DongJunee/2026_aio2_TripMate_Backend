@@ -52,6 +52,7 @@ class DashboardRoutePlanTests(unittest.TestCase):
         self.assertEqual(result["total_distance_meters"], 0)
         self.assertEqual(result["unknown_leg_count"], 1)
 
+<<<<<<< HEAD
     def test_weather_outside_forecast_window_does_not_call_openweather(self):
         """장기 여행에는 정확하지 않은 예상 날씨 대신 예보 전을 표시한다.
 
@@ -66,6 +67,16 @@ class DashboardRoutePlanTests(unittest.TestCase):
             )
         self.assertEqual(result, {"status": "pending", "label": "예보 전"})
         weather_client.from_environment.assert_not_called()
+=======
+    def test_weather_outside_forecast_range_does_not_call_weather_api(self):
+        """장기 여행에는 정확하지 않은 예상 날씨 대신 예보 전을 표시한다."""
+        result = maps._weather_for_day(
+            {"timezone": "Asia/Seoul"},
+            {"travel_date": "2099-01-01"},
+            self.markers()[:1],
+        )
+        self.assertEqual(result, {"status": "pending", "label": "예보 전"})
+>>>>>>> 2c16d5b (OpenMeteoChange)
 
 
 if __name__ == "__main__":

@@ -1388,10 +1388,8 @@ for key in client.scan_iter(match='destination_search:*'):
 
 ### 9-5. 남은 사항 (이 계획과 무관)
 
-- `tests/test_dashboard_route_plan.py::test_weather_outside_ten_days_does_not_call_google`
-  가 `_weather_for_day() takes 3 positional arguments but 4 were given` 로 실패한다.
-  `git diff` 상 이 계획이 건드리지 않은 날씨 코드이며, **적용 전부터 실패하던
-  테스트**다. 나머지 91건은 통과한다.
+- 날씨 예보 클라이언트는 Open-Meteo로 교체되었고, 예보 범위 회귀 테스트도
+  현재 함수 시그니처에 맞게 정리되었다.
 - 진단 과정에서 Google Places 호출을 많이 써 **HTTP 429** 가 났다. 잠시 뒤 풀린다.
   429 상태에서 검색하면 502 가 뜨는데 코드 문제가 아니다.
 

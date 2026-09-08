@@ -26,10 +26,9 @@ from app.google_maps_client import (
     GoogleMapsUnavailableError,
     StaticMapMarker,
 )
-from app.openweather_client import (
-    OpenWeatherClient,
-    OpenWeatherError,
-    OpenWeatherUnavailableError,
+from app.openmeteo_client import (
+    OpenMeteoClient,
+    OpenMeteoError,
 )
 from app.routers.trips import _owned_day, _owned_trip, touch_trip
 from app.schemas import AccommodationPlaceUpdate, GooglePlaceItineraryCreate
@@ -501,7 +500,7 @@ def _automatic_route_plan(maps: GoogleMapsClient, markers: list[dict]) -> dict:
 
 
 def _weather_for_day(trip: dict, day: dict, markers: list[dict]) -> dict:
-    """OpenWeather 예보를 여행 화면에서 쓸 수 있는 일별 값으로 반환한다."""
+    """Open-Meteo 예보를 여행 화면에서 쓸 수 있는 일별 값으로 반환한다."""
 
     if not markers:
         return {"status": "unavailable", "label": "장소 좌표 없음"}
@@ -513,13 +512,13 @@ def _weather_for_day(trip: dict, day: dict, markers: list[dict]) -> dict:
     offset = (travel_date - local_today).days
     if offset < 0:
         return {"status": "unavailable", "label": "지난 날짜"}
-    # OpenWeather의 기본 5일/3시간 예보를 사용한다. 유료 One Call API 구독 없이
-    # 쓸 수 있는 범위이며, 그 이후 날짜는 API에 요청하지 않고 안내만 표시한다.
-    if offset > 5:
+    # Open-Meteo에 오늘을 포함한 최대 16일을 요청하므로 offset 0~15까지만
+    # 조회한다. 그 이후 날짜는 정확하지 않은 예상 날씨 대신 안내만 표시한다.
+    if offset > 15:
         return {"status": "pending", "label": "예보 전"}
 
     signature = {"lat": markers[0]["latitude"], "lng": markers[0]["longitude"], "date": str(travel_date)}
-    cache_key = _cache_key("openweather_daily", signature)
+    cache_key = _cache_key("openmeteo_daily", signature)
     cached = cache_get(cache_key)
     if cached:
         try:
@@ -527,12 +526,10 @@ def _weather_for_day(trip: dict, day: dict, markers: list[dict]) -> dict:
         except json.JSONDecodeError:
             pass
     try:
-        forecasts = OpenWeatherClient.from_environment().get_daily_forecasts(
+        forecasts = OpenMeteoClient().get_daily_forecasts(
             Coordinates(markers[0]["latitude"], markers[0]["longitude"])
         )
-    except OpenWeatherUnavailableError:
-        return {"status": "unavailable", "label": "OpenWeather 키 확인 필요"}
-    except OpenWeatherError:
+    except OpenMeteoError:
         return {"status": "unavailable", "label": "예보 확인 안 됨"}
     forecast = next(
         (value for value in forecasts if value.get("date") == str(travel_date)),

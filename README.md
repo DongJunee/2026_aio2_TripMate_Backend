@@ -49,7 +49,12 @@ Open <http://127.0.0.1:8000/docs> to test the API.
 - Gemini travel-planner response streamed to the chat screen when `GEMINI_API_KEY` is configured
 - backend-only Google Places (New) search, selected-place persistence, and
   Google Routes path/duration for the interactive browser map
+- Open-Meteo daily weather forecast for up to 16 days in the route-plan
+  dashboard; no API key is required
 - administrator dashboard summary and operations-console user/trip log lookup
+
+Weather data is provided by [Open-Meteo](https://open-meteo.com/) under its
+attribution terms.
 
 The backend retains an optional Maps Static API image proxy for a standard
 billed key, but the Streamlit screen now uses Maps JavaScript API so local
