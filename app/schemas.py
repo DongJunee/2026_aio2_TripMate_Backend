@@ -86,6 +86,21 @@ class TravelPreferenceFields(BaseModel):
     travel_intensity: int = Field(default=3, ge=1, le=5, strict=True)
     budget_level: int = Field(default=3, ge=1, le=5, strict=True)
 
+#lsw 0908
+class MustVisitPlace(BaseModel):
+    """화면 '가고 싶은 장소'에서 고른 곳 하나이다.
+
+    [변경 사유] 이름만 받지 않는다. 사용자는 검색 결과에서 특정 지점을 골랐고
+    그 google_place_id 를 이미 알고 있다. 이름만 넘기면 나중에 다시 검색할 때
+    같은 이름의 다른 지점이 잡힐 수 있다 — '스타벅스'가 대표적이다.
+
+    [변경 사유] google_place_id 는 선택으로 둔다. 대화나 자유 입력으로 들어온
+    장소명도 같은 칸을 쓰게 해서, 입력 경로마다 모델이 갈라지지 않게 한다.
+    """
+
+    name: str = Field(min_length=1, max_length=150)
+    google_place_id: str | None = Field(default=None, max_length=255)
+
 
 class TripCreate(TravelPreferenceFields):
     """새 여행을 만들 때 입력하는 기본 정보이다."""
@@ -96,6 +111,9 @@ class TripCreate(TravelPreferenceFields):
     timezone: str | None = Field(default=None, min_length=1, max_length=64)
     start_date: date | None = None
     end_date: date | None = None
+
+#lsw 0908
+    must_visit: list[MustVisitPlace] = Field(default_factory=list, max_length=5)
 
     @model_validator(mode="after")
     def validate_dates(self):

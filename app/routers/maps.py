@@ -35,6 +35,16 @@ from app.routers.trips import _owned_day, _owned_trip, touch_trip
 from app.schemas import AccommodationPlaceUpdate, GooglePlaceItineraryCreate
 from app.services.destination_scope import DestinationScope, resolve_destination_scope
 
+#LSW 수정 0908
+from app.services.destination_scope import (
+    DestinationScope,
+    #여행 만들기 화면이 도시 후보 목록을 받는다.
+    # 화면에 보여 줄 도시 이름("도쿄도" 대신 "도쿄")을 서버가 정한다.
+    display_label,
+    list_destination_candidates,
+    resolve_destination_scope,
+)
+
 
 router = APIRouter(tags=["maps"])
 LOGGER = logging.getLogger(__name__)
@@ -50,6 +60,9 @@ _ROUTE_MEMORY_CACHE: dict[str, tuple[float, dict]] = {}
 _DESTINATION_SCOPE_MEMORY_CACHE: dict[str, tuple[float, DestinationScope]] = {}
 DESTINATION_SCOPE_CACHE_TTL_SECONDS = 3_600
 
+#LSW 수정 0908
+# 검색어 한 글자마다 유료 Places 호출이 나가지 않도록 도시 범위 캐시와 같은 수명(1시간)을 준다.
+DESTINATION_SEARCH_CACHE_TTL_SECONDS = 3_600
 
 def _cache_key(prefix: str, values: object) -> str:
     """긴 검색어를 직접 넣지 않고 길이가 제한된 Redis 키를 반환한다."""
@@ -95,6 +108,20 @@ def _destination_scope_for_search(
         scope,
     )
     return scope
+
+#LSW 수정 0908
+def _country_name(place) -> str | None:
+    """도시 응답에서 나라 이름만 꺼낸다.
+
+    [변경 사유] DestinationScope.country_names 는 비교용이라 casefold 된
+    frozenset 이다. 화면에 그대로 쓸 수 없다. formatted_address 에서 나라를
+    잘라내는 방법도 쓰지 않는다 — 표기 순서가 언어마다 달라 추측이 된다.
+    Google 이 country 로 표시한 구성요소만 읽는다.
+    """
+    for component in place.address_components:
+        if "country" in component.types:
+            return component.long_text or component.short_text or None
+    return None
 
 
 def _places_inside_destination(
@@ -615,6 +642,87 @@ def set_trip_accommodation(
         raise HTTPException(status_code=400, detail="숙소를 저장하지 못했습니다.")
     touch_trip(client, trip_id)
     return {"trip": result.data[0], "place": place}
+
+#LSW 수정 0908
+@router.get("/destinations/search", dependencies=[Depends(get_current_user)])
+def search_destinations(query: str = Query(min_length=2, max_length=100)):
+    """여행을 만들기 전에 Google이 도시로 확인한 후보만 보여준다.
+     여행 생성은 도시 범위를 하나로 좁히지 못하면 거절하는데 n그 판정이 Gemini 호출(최대 180초) 뒤에 일어난다. 여기서 먼저 고르게 하면
+    사용자가 생성 시간을 다 기다린 뒤에 422 를 받는 일이 없고 버려지는
+    LLM 호출도 없다.
+
+    여행 소유권을 확인할 여행이 아직 없으므로 로그인만 요구한다.
+    trip_id 를 요구하는 기존 검색과 달리 여행 만들기 화면에서 부를 수 있어야 한다.
+    """
+    cleaned = query.strip()
+    cache_key = _cache_key("destination_search", {"query": cleaned.casefold(), "v": 1})
+    cached = cache_get(cache_key)
+    if cached:
+        try:
+            return json.loads(cached)
+        except json.JSONDecodeError:
+            # 형식이 잘못된 선택적 캐시 항목이 실제 검색을 막으면 안 된다.
+            pass
+
+    try:
+        candidates = list_destination_candidates(_maps_client(), cleaned)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except GoogleMapsError as error:
+        raise _maps_request_error(error) from error
+
+    destinations = []
+    for place, _ in candidates:
+        country = _country_name(place)
+        destinations.append({
+            "google_place_id": place.google_place_id,
+            "display_name": place.display_name,
+            "country": country,
+            "formatted_address": place.formatted_address,
+            "latitude": place.coordinates.latitude if place.coordinates else None,
+            "longitude": place.coordinates.longitude if place.coordinates else None,
+            # 여행 생성에 그대로 넣을 문자열을 서버가 만든다.
+            # 화면이 이름과 나라를 다시 조합하면 표기가 갈리고, 생성 단계의
+            # 도시 조회가 후보를 하나로 좁히지 못해 422 가 날 수 있다.
+            "destination": f"{place.display_name}, {country}" if country else place.display_name,
+            # 화면에 보여 줄 이름. Google 표기가 "도쿄도"라 그대로 쓰면 어색하다.
+            # 위 destination 과 일부러 나눠 둔다 — 보내는 값은 Google 표기여야
+            # 생성 단계에서 도시를 다시 찾을 수 있고, 읽는 값은 사람이 쓰는
+            # 이름이어야 고르기 쉽다.
+            "label": display_label(place),
+        })
+
+    response = {"query": cleaned, "destinations": destinations}
+    # [변경 사유] 빈 결과는 담지 않는다. 담아 두면 두 가지가 한 시간 동안 고정된다 —
+    # 서버를 고쳐 이제 찾을 수 있게 된 도시가 계속 "없음"으로 나오고(실제로
+    # 도쿄·서울 허용 목록을 넣은 뒤에도 옛 빈 답이 그대로 나갔다), Google 이
+    # 일시적으로 실패해 비어 온 답까지 굳어 버린다.
+    # 오타는 사용자가 곧바로 고쳐 다시 치므로 같은 빈 검색이 반복될 일이 적다.
+    if destinations:
+        cache_set(
+            cache_key,
+            json.dumps(response, ensure_ascii=False),
+            DESTINATION_SEARCH_CACHE_TTL_SECONDS,
+        )
+    return response
+#LSW 수정 0908
+@router.get("/destinations/places/search", dependencies=[Depends(get_current_user)])
+def search_destination_places(
+    destination: str = Query(min_length=1, max_length=100),
+    query: str = Query(min_length=1, max_length=500),
+    max_results: int = Query(default=5, ge=1, le=10),
+):
+    """여행을 만들기 전에도 고른 여행지 안에서만 장소를 찾는다.
+    여행 안 검색(/trips/{trip_id}/...)과 같은 _search_response 를 쓴다.
+    화면이 필요한 값과 도시 밖 결과를 거르는 기준이 같으므로, 검색 경로를 둘로
+    나누면 한쪽만 고치는 어긋남이 생긴다. 다른 점은 소유권을 확인할 여행이
+    아직 없다는 것뿐이라 도시 범위 검증만 그대로 적용한다.
+    destination 을 필수로 받는다. 지역 없이 "스타벅스"를 찾으면
+    전 세계 결과가 나오고 그중 무엇을 담아도 이 여행의 일정에 쓸 수 없다.
+    화면이 잠금을 빠뜨려도 여기서 422 가 나서 전 세계 검색으로 새지 않는다.
+    """
+    return _search_response(_maps_client(), query, destination, max_results)
+
 
 
 @router.get("/trips/{trip_id}/days/{day_id}/places/search")

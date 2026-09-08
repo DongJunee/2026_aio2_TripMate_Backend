@@ -746,12 +746,27 @@ def create_my_trip(
 
     client = get_user_client(current_user.token)
     trip_values = payload.model_dump(mode="json")
+        # must_visit 은 trips 테이블에 없는 칼럼이다. trip_values 는
+    # 아래(trips.py:776)에서 그대로 insert 되므로, 여기서 빼지 않으면 삽입이
+    # 통째로 실패한다. 초안 생성에만 쓰는 값이라 사본으로만 넘긴다.
+    must_visit = trip_values.pop("must_visit", [])
+    # [변경 사유] 이름만 프롬프트에 넣는다. google_place_id 는 모델이 쓸 값이
+    # 아니고, 정확한 지점 반영은 아래 6·7단계(선택)에서 다룬다.
+    must_visit_names = [
+        text for place in must_visit
+        if (text := str(place.get("name") or "").strip())
+    ]
+
     days = _initial_trip_days(payload)
 
     # Gemini와 Google Places 조회는 trips 행을 만들기 전에 끝낸다. 따라서 둘 중
     # 하나라도 실패하면 사용자의 여행 목록에는 새 여행이 전혀 생기지 않는다.
     try:
-        generated = generate_daily_itinerary_drafts(trip_values, days)
+        # trip_values 자체를 오염시키지 않으려고 사본을 만든다.
+        # 이 dict 는 프롬프트 입력으로만 흐르고 DB 로는 가지 않는다.
+        generated = generate_daily_itinerary_drafts(
+            {**trip_values, "must_visit": must_visit_names}, days
+        )
     except ValueError as error:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,

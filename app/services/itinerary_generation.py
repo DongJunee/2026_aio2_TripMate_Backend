@@ -177,6 +177,23 @@ def _generation_system_prompt(
     """서버가 정한 칸마다 Google Places 검색 후보 하나만 반환하도록 요청한다."""
 
     destination = str(trip.get("destination") or "여행지").strip() or "여행지"
+#LSW 0908 
+    # 사용자가 직접 고른 장소는 모델이 추천한 장소보다 우선한다.
+    # 이 목록이 비면 프롬프트에 빈 줄이 들어가지 않도록 문자열 자체를 비운다 —
+    # 조건 없는 안내문은 모델이 없는 제약을 지어내는 원인이 된다.
+    # trip.get 으로 읽으므로, 이 키가 없는 다른 호출 경로
+    # (DB 에서 읽은 여행 행 등)는 그대로 None 을 받아 영향이 없다.
+    must_visit = [
+        text for name in trip.get("must_visit") or []
+        if (text := str(name).strip())
+    ]
+    must_visit_instruction = (
+        "\n사용자가 직접 고른 '가고 싶은 장소': " + ", ".join(must_visit) + "\n"
+        "이 장소들을 어울리는 slot 의 place_query 로 먼저 배치하세요. "
+        "여행 도시 밖이거나 slot 종류(식당/활동)와 맞지 않으면 넣지 말고 다른 장소로 채우세요. "
+        "이 목록 때문에 칸을 추가하거나 시간을 바꾸지 마세요."
+        if must_visit else ""
+    )
     timezone = str(trip.get("timezone") or "").strip()
     timezone_instruction = (
         f"지정된 IANA 시간대: {timezone}. 응답 timezone에도 이 값을 그대로 사용하세요."
@@ -221,7 +238,7 @@ def _generation_system_prompt(
 
     return f"""
 당신은 TripMate의 여행 일정 초안 생성기입니다.
-여행지: {destination}
+여행지: {destination}{must_visit_instruction}
 {timezone_instruction}
 대상 DAY:
 {chr(10).join(day_lines)}
