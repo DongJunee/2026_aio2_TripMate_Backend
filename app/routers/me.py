@@ -22,7 +22,7 @@ def _verify_current_password(current_user: CurrentUser, password: str) -> None:
         raise HTTPException(status_code=400, detail="현재 비밀번호를 확인하세요.")
 
 
-@router.get("")
+@router.get("", summary="내 정보 조회")
 def read_me(current_user: CurrentUser = Depends(get_current_user)):
     """인증된 사용자의 Auth 식별 정보와 서비스 프로필을 반환한다."""
 
@@ -38,7 +38,11 @@ def read_me(current_user: CurrentUser = Depends(get_current_user)):
     }
 
 
-@router.patch("/profile")
+@router.patch(
+    "/profile", summary="내 프로필과 Mate 방식 변경",
+    response_description="변경 후 현재 사용자의 프로필",
+    responses={401: {"description": "Bearer 토큰이 없거나 유효하지 않음"}, 404: {"description": "현재 사용자의 프로필을 찾을 수 없음"}},
+)
 def update_profile(
     payload: ProfileUpdate,
     current_user: CurrentUser = Depends(get_current_user),
@@ -70,7 +74,7 @@ def update_profile(
     return result.data[0]
 
 
-@router.post("/password", response_model=MessageResponse)
+@router.post("/password", response_model=MessageResponse, summary="비밀번호 변경")
 def change_password(
     payload: PasswordChangeRequest,
     current_user: CurrentUser = Depends(get_current_user),

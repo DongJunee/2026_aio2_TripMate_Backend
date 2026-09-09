@@ -772,7 +772,7 @@ def _sync_trip_days_for_dates(
         client.table("trip_days").insert(new_days).execute()
 
 
-@router.get("/me/trips")
+@router.get("/me/trips", summary="내 여행 목록 조회")
 def list_my_trips(current_user: CurrentUser = Depends(get_current_user)):
     """로그인한 사용자의 여행을 최근 활동 순으로 반환한다."""
 
@@ -787,7 +787,11 @@ def list_my_trips(current_user: CurrentUser = Depends(get_current_user)):
     )
 
 
-@router.post("/me/trips", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/me/trips", status_code=status.HTTP_201_CREATED, summary="AI 여행 일정 생성",
+    response_description="생성된 여행과 일차별 일정 정보",
+    responses={401: {"description": "로그인이 필요함"}, 500: {"description": "여행 또는 일정 저장 실패"}, 502: {"description": "AI 일정 초안 또는 Google Places 검증 실패"}},
+)
 def create_my_trip(
     payload: TripCreate,
     current_user: CurrentUser = Depends(get_current_user),
@@ -884,7 +888,11 @@ def create_my_trip(
     return dashboard
 
 
-@router.get("/trips/{trip_id}/dashboard")
+@router.get(
+    "/trips/{trip_id}/dashboard", summary="여행 대시보드 조회",
+    response_description="여행 기본 정보, DAY별 일정, 연결된 장소 정보",
+    responses={401: {"description": "로그인이 필요함"}, 404: {"description": "여행을 찾을 수 없거나 접근 권한이 없음"}},
+)
 def read_trip_dashboard(
     trip_id: UUID,
     current_user: CurrentUser = Depends(get_current_user),
@@ -894,7 +902,7 @@ def read_trip_dashboard(
     return trip_dashboard(get_user_client(current_user.token), trip_id)
 
 
-@router.patch("/trips/{trip_id}/pin")
+@router.patch("/trips/{trip_id}/pin", summary="여행 고정 상태 변경")
 def update_trip_pin(
     trip_id: UUID,
     payload: TripPinUpdate,
@@ -955,7 +963,7 @@ def update_trip_pin(
     return _owned_trip(client, trip_id)
 
 
-@router.patch("/trips/{trip_id}")
+@router.patch("/trips/{trip_id}", summary="여행 기본 정보 수정")
 def update_trip(
     trip_id: UUID,
     payload: TripUpdate,
@@ -980,7 +988,7 @@ def update_trip(
     return trip_dashboard(client, trip_id)
 
 
-@router.patch("/trips/{trip_id}/dates")
+@router.patch("/trips/{trip_id}/dates", summary="여행 날짜 변경")
 def update_trip_dates(
     trip_id: UUID,
     payload: TripDateRangeUpdate,
@@ -1027,7 +1035,7 @@ def update_trip_dates(
     return trip_dashboard(client, trip_id)
 
 
-@router.delete("/trips/{trip_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/trips/{trip_id}", status_code=status.HTTP_204_NO_CONTENT, summary="여행 삭제")
 def delete_trip(
     trip_id: UUID,
     current_user: CurrentUser = Depends(get_current_user),
@@ -1047,7 +1055,7 @@ def delete_trip(
     client.table("trips").delete().eq("id", str(trip_id)).execute()
 
 
-@router.post("/trips/{trip_id}/days", status_code=status.HTTP_201_CREATED)
+@router.post("/trips/{trip_id}/days", status_code=status.HTTP_201_CREATED, summary="여행 일차 추가")
 def create_trip_day(
     trip_id: UUID,
     payload: TripDayCreate,
@@ -1073,7 +1081,7 @@ def create_trip_day(
     return result.data[0]
 
 
-@router.post("/trips/{trip_id}/itinerary-items", status_code=status.HTTP_201_CREATED)
+@router.post("/trips/{trip_id}/itinerary-items", status_code=status.HTTP_201_CREATED, summary="일정 항목 추가")
 def create_itinerary_item(
     trip_id: UUID,
     payload: ItineraryItemCreate,
@@ -1115,7 +1123,7 @@ def create_itinerary_item(
     return result.data[0]
 
 
-@router.patch("/trips/{trip_id}/itinerary-items/{item_id}")
+@router.patch("/trips/{trip_id}/itinerary-items/{item_id}", summary="일정 항목 수정")
 def update_itinerary_item(
     trip_id: UUID,
     item_id: UUID,
@@ -1155,7 +1163,7 @@ def update_itinerary_item(
     return result.data[0]
 
 
-@router.post("/trips/{trip_id}/itinerary-items/{item_id}/time")
+@router.post("/trips/{trip_id}/itinerary-items/{item_id}/time", summary="일정 시간 변경")
 def update_itinerary_item_time(
     trip_id: UUID,
     item_id: UUID,
@@ -1361,7 +1369,65 @@ def apply_ai_place_swap(
     return {"items": changed_items, "change": _change_status(change_log, trip.get("timezone"))}
 
 
-@router.post("/trips/{trip_id}/itinerary-items/{item_id}/swap-place")
+def apply_ai_time_change(
+    client,
+    trip_id: UUID | str,
+    item_id: UUID | str,
+    new_start_time: time,
+) -> dict:
+    """AI가 명확히 식별한 한 일정의 시간을 실제 DB와 변경 로그에 함께 저장한다."""
+
+    trip = _owned_trip(client, trip_id)
+    existing_result = (
+        client.table("itinerary_items").select("*").eq("id", str(item_id))
+        .eq("trip_id", str(trip_id)).execute()
+    )
+    if not existing_result.data:
+        raise HTTPException(status_code=404, detail="시간을 바꿀 일정을 찾을 수 없습니다.")
+    existing = existing_result.data[0]
+    if not existing.get("trip_day_id"):
+        raise HTTPException(status_code=422, detail="DAY에 연결되지 않은 일정은 시간을 바꿀 수 없습니다.")
+    day = _owned_day(client, trip_id, existing["trip_day_id"])
+    old_start = _local_datetime_for_day(day, time(0, 0), trip.get("timezone"))
+    try:
+        old_start = datetime.fromisoformat(str(existing["start_at"]).replace("Z", "+00:00"))
+        old_end = datetime.fromisoformat(str(existing["end_at"]).replace("Z", "+00:00"))
+        duration = old_end - old_start
+        if duration <= timedelta(0):
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        duration = timedelta(minutes=60)
+    new_start = _local_datetime_for_day(day, new_start_time, trip.get("timezone"))
+    new_end = new_start + duration
+    before_data = _change_data([existing])
+    values = {
+        "start_at": new_start.isoformat(),
+        "end_at": new_end.isoformat(),
+        "estimated_stay_minutes": int(duration.total_seconds() // 60),
+        "is_fixed": True,
+    }
+    try:
+        result = client.table("itinerary_items").update(values).eq("id", str(item_id)).eq(
+            "trip_id", str(trip_id)
+        ).execute()
+        if not result.data:
+            raise RuntimeError("AI가 수정한 일정 행을 반환받지 못했습니다.")
+        changed = result.data[0]
+        change_log = _record_itinerary_change(
+            client, trip_id, action_type="time_changed", actor_type="ai",
+            before_data=before_data,
+            after_data=_change_data([changed], {"message": f"AI가 DAY {day['day_number']}의 {changed.get('title') or '일정'} 시간을 변경했어요."}),
+        )
+    except Exception as error:
+        if isinstance(error, HTTPException):
+            raise error
+        LOGGER.warning("AI 일정 시간 변경 실패 (%s).", type(error).__name__)
+        raise HTTPException(status_code=500, detail="AI가 일정 시간을 바꾸지 못했습니다.") from error
+    touch_trip(client, trip_id)
+    return {"item": changed, "change": _change_status(change_log, trip.get("timezone"))}
+
+
+@router.post("/trips/{trip_id}/itinerary-items/{item_id}/swap-place", summary="일정 장소 교체")
 def swap_itinerary_item_place(
     trip_id: UUID,
     item_id: UUID,
@@ -1468,7 +1534,7 @@ def swap_itinerary_item_place(
     return {"items": changed_items, "change": _change_status(change_log, trip.get("timezone"))}
 
 
-@router.get("/trips/{trip_id}/itinerary-changes")
+@router.get("/trips/{trip_id}/itinerary-changes", summary="일정 변경 이력 조회")
 def list_itinerary_changes(
     trip_id: UUID,
     current_user: CurrentUser = Depends(get_current_user),
@@ -1511,7 +1577,7 @@ def _undo_values_match(field: str, current_value: object, saved_value: object) -
     return current_value == saved_value
 
 
-@router.post("/trips/{trip_id}/itinerary-changes/{log_id}/undo")
+@router.post("/trips/{trip_id}/itinerary-changes/{log_id}/undo", summary="일정 변경 되돌리기")
 def undo_itinerary_change(
     trip_id: UUID,
     log_id: UUID,
@@ -1652,7 +1718,8 @@ def undo_itinerary_change(
 
 
 @router.delete(
-    "/trips/{trip_id}/itinerary-items/{item_id}", status_code=status.HTTP_204_NO_CONTENT
+    "/trips/{trip_id}/itinerary-items/{item_id}", status_code=status.HTTP_204_NO_CONTENT,
+    summary="일정 항목 삭제",
 )
 def delete_itinerary_item(
     trip_id: UUID,
@@ -1737,7 +1804,7 @@ def _itinerary_export_zip(trip: dict, images: list[bytes | None]) -> Response:
     )
 
 
-@router.get("/trips/{trip_id}/itinerary/export")
+@router.get("/trips/{trip_id}/itinerary/export", summary="일정 이미지로 내보내기")
 def export_itinerary_image(
     trip_id: UUID,
     # 기본값을 심플형으로 둔다. 인쇄용이 더 자주 쓰이고, 시안에서도 심플형이
@@ -1788,7 +1855,7 @@ def export_itinerary_image(
     return _itinerary_export_zip(trip, images)
 
 
-@router.get("/trips/{trip_id}/itinerary/export/text")
+@router.get("/trips/{trip_id}/itinerary/export/text", summary="일정 텍스트로 내보내기")
 def export_itinerary_text(
     trip_id: UUID,
     current_user: CurrentUser = Depends(get_current_user),

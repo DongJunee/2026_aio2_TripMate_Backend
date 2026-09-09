@@ -10,7 +10,7 @@ import redis
 def get_redis() -> redis.Redis | None:
     """설정된 경우 Redis 연결 객체를 한 번 만들고 재사용한다.
 
-    REDIS_HOST가 비어 있으면 Redis 없이도 실습 서버가 실행되도록 None을 반환한다.
+    REDIS_HOST가 비어 있으면 Redis 없이도 애플리케이션이 실행되도록 None을 반환한다.
     """
     host = os.getenv("REDIS_HOST", "").strip()
     if not host:

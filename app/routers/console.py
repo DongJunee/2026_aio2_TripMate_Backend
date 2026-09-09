@@ -264,7 +264,7 @@ def _load_console_data(client: Any) -> tuple[list[Any], list[dict[str, Any]], li
     return users, profiles, trips, requests, activities
 
 
-@router.get("/feedback", response_model=ConsoleFeedbackSummary)
+@router.get("/feedback", response_model=ConsoleFeedbackSummary, summary="사용자 피드백 요약 조회")
 def console_feedback() -> ConsoleFeedbackSummary:
     """피드백·페이스 원문이 아닌 집계 결과만 반환한다."""
 
@@ -279,7 +279,7 @@ def console_feedback() -> ConsoleFeedbackSummary:
     )
 
 
-@router.get("/system-status", response_model=ConsoleSystemStatusResponse)
+@router.get("/system-status", response_model=ConsoleSystemStatusResponse, summary="시스템 상태 조회")
 def console_system_status() -> ConsoleSystemStatusResponse:
     """최근 1시간의 API 요청 로그로 서비스 상태를 계산한다."""
 
@@ -288,7 +288,7 @@ def console_system_status() -> ConsoleSystemStatusResponse:
     return _system_status(_period_rows(get_service_client(), start, end), start, end)
 
 
-@router.get("/users", response_model=ConsoleUserListResponse)
+@router.get("/users", response_model=ConsoleUserListResponse, summary="관리자용 사용자 목록 조회")
 def console_users(
     search: str | None = Query(default=None, max_length=100),
     limit: int = Query(default=50, ge=1, le=100),
@@ -315,7 +315,7 @@ def console_users(
     return ConsoleUserListResponse(items=items[offset : offset + limit], count=min(limit, max(total - offset, 0)), total=total)
 
 
-@router.get("/users/{user_id}", response_model=ConsoleUserDetail)
+@router.get("/users/{user_id}", response_model=ConsoleUserDetail, summary="관리자용 사용자 상세 조회")
 def console_user_detail(user_id: str) -> ConsoleUserDetail:
     try:
         users, profiles, trips, requests, activities = _load_console_data(get_service_client())

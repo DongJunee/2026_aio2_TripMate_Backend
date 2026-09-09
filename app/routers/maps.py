@@ -52,7 +52,7 @@ PLACE_DETAILS_CACHE_TTL_SECONDS = 86_400
 ROUTE_CACHE_TTL_SECONDS = 900
 WEATHER_CACHE_TTL_SECONDS = 3_600
 RouteTravelMode = Literal["walk", "transit", "drive", "bicycle"]
-# 이 실습 프로젝트에서 Redis는 선택 사항이다. 작은 프로세스 내부 대체 캐시는
+# 이 애플리케이션에서 Redis는 선택 사항이다. 작은 프로세스 내부 대체 캐시는
 # Redis가 설정되지 않았을 때 지도 JSON 요청과 바로 이어지는 이미지 요청이 같은
 # 유료 경로를 두 번 계산하지 않게 한다.
 _ROUTE_MEMORY_CACHE: dict[str, tuple[float, dict]] = {}
@@ -588,7 +588,7 @@ def _day_map_payload(
     )
 
 
-@router.get("/trips/{trip_id}/accommodation/places/search")
+@router.get("/trips/{trip_id}/accommodation/places/search", summary="여행 숙소 후보 검색")
 def search_trip_accommodation_places(
     trip_id: UUID,
     query: str = Query(min_length=1, max_length=500),
@@ -611,7 +611,7 @@ def search_trip_accommodation_places(
     )
 
 
-@router.post("/trips/{trip_id}/accommodation")
+@router.post("/trips/{trip_id}/accommodation", summary="여행 숙소 설정")
 def set_trip_accommodation(
     trip_id: UUID,
     payload: AccommodationPlaceUpdate,
@@ -641,10 +641,10 @@ def set_trip_accommodation(
     return {"trip": result.data[0], "place": place}
 
 #LSW 수정 0908
-@router.get("/destinations/search", dependencies=[Depends(get_current_user)])
+@router.get("/destinations/search", dependencies=[Depends(get_current_user)], summary="여행지 도시 검색")
 def search_destinations(query: str = Query(min_length=2, max_length=100)):
     """여행을 만들기 전에 Google이 도시로 확인한 후보만 보여준다.
-     여행 생성은 도시 범위를 하나로 좁히지 못하면 거절하는데 n그 판정이 Gemini 호출(최대 180초) 뒤에 일어난다. 여기서 먼저 고르게 하면
+     여행 생성은 도시 범위를 하나로 좁히지 못하면 거절하는데 그 판정이 Gemini 호출(최대 180초) 뒤에 일어난다. 여기서 먼저 고르게 하면
     사용자가 생성 시간을 다 기다린 뒤에 422 를 받는 일이 없고 버려지는
     LLM 호출도 없다.
 
@@ -703,7 +703,7 @@ def search_destinations(query: str = Query(min_length=2, max_length=100)):
         )
     return response
 #LSW 수정 0908
-@router.get("/destinations/places/search", dependencies=[Depends(get_current_user)])
+@router.get("/destinations/places/search", dependencies=[Depends(get_current_user)], summary="여행지 장소 검색")
 def search_destination_places(
     destination: str = Query(min_length=1, max_length=100),
     query: str = Query(min_length=1, max_length=500),
@@ -722,7 +722,7 @@ def search_destination_places(
 
 
 
-@router.get("/trips/{trip_id}/days/{day_id}/places/search")
+@router.get("/trips/{trip_id}/days/{day_id}/places/search", summary="일정에 추가할 장소 검색")
 def search_trip_places(
     trip_id: UUID,
     day_id: UUID,
@@ -761,6 +761,7 @@ def search_trip_places(
 @router.post(
     "/trips/{trip_id}/days/{day_id}/google-places",
     status_code=status.HTTP_201_CREATED,
+    summary="Google 장소를 일정에 추가",
 )
 def add_google_place_to_day(
     trip_id: UUID,
@@ -816,7 +817,7 @@ def add_google_place_to_day(
     return result.data[0]
 
 
-@router.get("/trips/{trip_id}/days/{day_id}/map")
+@router.get("/trips/{trip_id}/days/{day_id}/map", summary="일정 지도 정보 조회")
 def read_day_map(
     trip_id: UUID,
     day_id: UUID,
@@ -830,7 +831,7 @@ def read_day_map(
     return payload
 
 
-@router.get("/trips/{trip_id}/days/{day_id}/route-plan")
+@router.get("/trips/{trip_id}/days/{day_id}/route-plan", summary="일정 이동 경로 조회")
 def read_day_route_plan(
     trip_id: UUID,
     day_id: UUID,
@@ -857,7 +858,7 @@ def read_day_route_plan(
     }
 
 
-@router.get("/trips/{trip_id}/days/{day_id}/map/image")
+@router.get("/trips/{trip_id}/days/{day_id}/map/image", summary="일정 지도 이미지 조회")
 def read_day_map_image(
     trip_id: UUID,
     day_id: UUID,

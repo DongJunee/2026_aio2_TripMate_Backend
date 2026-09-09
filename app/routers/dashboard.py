@@ -240,7 +240,7 @@ def _load_dashboard_data(period: DashboardPeriod) -> tuple[list[dict[str, Any]],
     return request_rows, len(signup_rows)
 
 
-@router.get("/summary", response_model=DashboardSummaryResponse, dependencies=[Depends(require_dashboard_admin)])
+@router.get("/summary", response_model=DashboardSummaryResponse, dependencies=[Depends(require_dashboard_admin)], summary="운영 대시보드 요약 조회")
 def dashboard_summary(
     start_at: datetime | None = Query(default=None),
     end_at: datetime | None = Query(default=None),
@@ -270,7 +270,7 @@ def dashboard_summary(
     )
 
 
-@router.get("/endpoints", response_model=list[EndpointUsageStat], dependencies=[Depends(require_dashboard_admin)])
+@router.get("/endpoints", response_model=list[EndpointUsageStat], dependencies=[Depends(require_dashboard_admin)], summary="API 엔드포인트 사용량 조회")
 def dashboard_endpoints(
     start_at: datetime | None = Query(default=None),
     end_at: datetime | None = Query(default=None),
@@ -283,7 +283,7 @@ def dashboard_endpoints(
     return _endpoint_stats(request_rows)
 
 
-@router.get("/errors", response_model=ErrorLogResponse, dependencies=[Depends(require_dashboard_admin)])
+@router.get("/errors", response_model=ErrorLogResponse, dependencies=[Depends(require_dashboard_admin)], summary="오류 요청 로그 조회")
 def dashboard_errors(
     start_at: datetime | None = Query(default=None),
     end_at: datetime | None = Query(default=None),

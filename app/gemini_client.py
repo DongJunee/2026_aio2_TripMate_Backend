@@ -4,7 +4,7 @@ import json
 import os
 import re
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import datetime, time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from google import genai
@@ -186,6 +186,90 @@ def resolve_itinerary_place_swap_request(
     return first_item_id, second_item_id
 
 
+def _local_item_time(value: object, timezone_name: object) -> datetime | None:
+    """저장된 일정 시간을 여행지 현지 시간으로 읽는다."""
+
+    try:
+        zone = ZoneInfo(str(timezone_name or "Asia/Seoul"))
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=zone) if parsed.tzinfo is None else parsed.astimezone(zone)
+    except (TypeError, ValueError, ZoneInfoNotFoundError):
+        return None
+
+
+def _mentioned_times(message: str) -> list[time]:
+    """'21:30', '22시', '22시 15분'처럼 문장에 적힌 시각을 순서대로 찾는다."""
+
+    found: list[time] = []
+    pattern = r"(?<!\d)([01]?\d|2[0-3])(?:\s*:\s*([0-5]\d)|\s*시(?:\s*([0-5]?\d)\s*분?)?)"
+    for match in re.finditer(pattern, message):
+        minute = match.group(2) or match.group(3) or "0"
+        found.append(time(int(match.group(1)), int(minute)))
+    return found
+
+
+def resolve_itinerary_time_change_request(
+    trip: dict,
+    days: list[dict],
+    user_message: str,
+) -> tuple[str, time] | None:
+    """명확한 채팅 시간 변경 요청에서 대상 일정 ID와 새 시작 시각을 찾는다.
+
+    AI가 임의로 대상을 고르지 않도록 제목·기존 시각이 유일하게 맞을 때만 적용한다.
+    다만 '22시부터로 바꿔줘'처럼 마지막 일정을 바로 이어 말하는 짧은 요청은
+    현재 DAY 전체의 마지막 일정 하나에만 적용한다.
+    """
+
+    text = user_message.strip()
+    if not text or not any(word in text for word in ("바꿔", "변경", "수정")):
+        return None
+    mentioned = _mentioned_times(text)
+    if not mentioned:
+        return None
+    candidates: list[dict] = []
+    for day in days:
+        for item in day.get("items") or []:
+            if item.get("id") and item.get("start_at") and item.get("end_at"):
+                candidates.append({**item, "day_number": day.get("day_number")})
+    if not candidates:
+        return None
+
+    new_time = mentioned[-1]
+    normalized_message = _normalized_schedule_label(text)
+    named = [
+        item for item in candidates
+        if len(_normalized_schedule_label(item.get("title"))) >= 3
+        and _normalized_schedule_label(item.get("title")) in normalized_message
+    ]
+    if len(named) == 1:
+        return str(named[0]["id"]), new_time
+
+    # '21:30 일정을 22시로'처럼 기존·새 시각을 모두 말하면 기존 시각으로 찾는다.
+    if len(mentioned) >= 2:
+        old_time = mentioned[-2]
+        matched = [
+            item for item in candidates
+            if (local := _local_item_time(item.get("start_at"), trip.get("timezone")))
+            and local.hour == old_time.hour and local.minute == old_time.minute
+        ]
+        if len(matched) == 1:
+            return str(matched[0]["id"]), new_time
+
+    # 직전 대화 맥락상 '22시부터로 바꿔줘'만 보낸 경우는 마지막 일정 한 건으로
+    # 한정한다. '마지막'을 명시했을 때도 같은 안전 규칙을 적용한다.
+    if "마지막" in text or (len(mentioned) == 1 and "부터" in text):
+        timed = [
+            (local, item)
+            for item in candidates
+            if (local := _local_item_time(item.get("start_at"), trip.get("timezone")))
+        ]
+        if timed:
+            latest_time, latest_item = max(timed, key=lambda row: row[0])
+            if latest_time.time() != new_time:
+                return str(latest_item["id"]), new_time
+    return None
+
+
 def _schedule_summary(days: list[dict], timezone_name: str = "Asia/Seoul") -> str:
     """여행지 현지 시각으로 확정 일정을 요약해 채팅도 같은 시계를 사용하게 한다."""
     trip_timezone = ZoneInfo(timezone_name)
@@ -231,7 +315,7 @@ def _travel_generation_inputs(
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY 값을 backend/.env에 입력하세요.")
 
-    # .env에서 모델을 비워 두면 실습용 기본 모델을 사용한다.
+    # .env에서 모델을 비워 두면 기본 모델을 사용한다.
     model = os.getenv("GEMINI_MODEL", "").strip() or "gemini-3.5-flash-lite"
     mate_guidance = {
         "assistant": "핵심 내용을 먼저 짧고 명확하게 전달하는 비서처럼 답하세요.",

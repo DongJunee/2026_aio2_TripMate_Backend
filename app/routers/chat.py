@@ -9,8 +9,12 @@ from app.activity_logging import record_activity
 from app.cache import cache_delete, cache_get, cache_set
 from app.db import get_user_client
 from app.deps import CurrentUser, get_current_user, require_own_trip
-from app.gemini_client import generate_travel_reply_stream, resolve_itinerary_place_swap_request
-from app.routers.trips import apply_ai_place_swap, touch_trip, trip_dashboard
+from app.gemini_client import (
+    generate_travel_reply_stream,
+    resolve_itinerary_place_swap_request,
+    resolve_itinerary_time_change_request,
+)
+from app.routers.trips import apply_ai_place_swap, apply_ai_time_change, touch_trip, trip_dashboard
 from app.schemas import ChatRequest
 
 router = APIRouter(tags=["chat"])
@@ -150,7 +154,7 @@ def _stream_fixed_answer(
     )
 
 
-@router.get("/trips/{trip_id}/messages")
+@router.get("/trips/{trip_id}/messages", summary="여행 채팅 기록 조회")
 def list_messages(
     trip_id: UUID = Depends(require_own_trip),
     current_user: CurrentUser = Depends(get_current_user),
@@ -160,7 +164,11 @@ def list_messages(
     return _messages(get_user_client(current_user.token), trip_id)
 
 
-@router.post("/trips/{trip_id}/chat")
+@router.post(
+    "/trips/{trip_id}/chat", summary="AI 여행 채팅 보내기",
+    response_description="Server-Sent Events 형식의 AI 답변",
+    responses={401: {"description": "로그인이 필요함"}, 404: {"description": "여행을 찾을 수 없거나 접근 권한이 없음"}},
+)
 def chat(
     payload: ChatRequest,
     trip_id: UUID = Depends(require_own_trip),
@@ -222,10 +230,30 @@ def chat(
         # 막지 않도록 로그만 남기고 아래의 기존 스트리밍 답변으로 진행한다.
         LOGGER.warning("AI 일정 순서 변경 해석 실패 (%s).", type(error).__name__)
 
+    # 시간 변경도 Gemini의 말만으로 끝내지 않는다. 대상과 새 시각이 명확할 때만
+    # 권한·여행 소속·변경 로그를 검증하는 trips 함수가 실제 DB를 수정한다.
+    try:
+        time_change_request = resolve_itinerary_time_change_request(
+            dashboard["trip"], dashboard["days"], payload.content
+        )
+        if time_change_request:
+            item_id, new_start_time = time_change_request
+            changed = apply_ai_time_change(client, trip_id, item_id, new_start_time)
+            change = changed["change"]
+            return _stream_fixed_answer(
+                client,
+                trip_id,
+                f"요청대로 {change['message']} {change['detail']}로 변경했어요. 아래 일정 변경 카드에서 되돌릴 수도 있어요.",
+            )
+    except HTTPException as error:
+        LOGGER.info("AI 일정 시간 변경을 적용하지 않았습니다: %s", error.detail)
+    except Exception as error:
+        LOGGER.warning("AI 일정 시간 변경 해석 실패 (%s).", type(error).__name__)
+
     # 이 지점부터 오류는 이미 열린 SSE 스트림 안에서 전달한다.
     return _stream_answer(client, trip_id, dashboard, history, payload.content, mate_type)
 
-@router.post("/trips/{trip_id}/chat/reset-context")
+@router.post("/trips/{trip_id}/chat/reset-context", summary="여행 채팅 기록 전체 삭제")
 def delete_chat_history(
     trip_id: UUID = Depends(require_own_trip),
     current_user: CurrentUser = Depends(get_current_user),

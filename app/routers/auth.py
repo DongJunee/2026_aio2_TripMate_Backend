@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException
 
 from app.db import get_anon_client, get_service_client
 from app.schemas import (
-    DemoPasswordResetRequest,
+    PasswordResetRequest,
     LoginRequest,
     MessageResponse,
     SignupRequest,
@@ -13,11 +13,10 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 def _find_user_by_email(service_client, email: str):
-    """서버 전용 Auth API로 실습 프로젝트 사용자를 찾는다.
+    """서버 전용 Auth API로 이메일에 해당하는 사용자를 찾는다.
 
     `profiles`에는 의도적으로 이메일 주소를 저장하지 않으므로, 먼저 Supabase
-    Auth에서 이메일을 찾고 이후 profiles에서 사용자 이름을 확인한다. 이는 작은
-    로컬 실습 프로젝트에만 알맞다.
+    Auth에서 이메일을 찾고 이후 profiles에서 사용자 이름을 확인한다.
     """
 
     result = service_client.auth.admin.list_users(page=1, per_page=1000)
@@ -33,7 +32,11 @@ def _find_user_by_email(service_client, email: str):
     )
 
 
-@router.post("/signup", response_model=TokenResponse)
+@router.post(
+    "/signup", response_model=TokenResponse, summary="회원가입",
+    response_description="생성된 계정 ID, 이메일, 액세스 토큰",
+    responses={400: {"description": "이미 사용 중인 이메일, 잘못된 가입 정보 또는 가입 처리 실패"}, 503: {"description": "Supabase 인증 서비스 설정 또는 연결 문제"}},
+)
 def signup(payload: SignupRequest):
     """Supabase Auth 계정을 만들고 가능하면 최초 세션을 반환한다."""
 
@@ -62,7 +65,11 @@ def signup(payload: SignupRequest):
     )
 
 
-@router.post("/login", response_model=TokenResponse)
+@router.post(
+    "/login", response_model=TokenResponse, summary="로그인",
+    response_description="액세스 토큰과 로그인 사용자 정보",
+    responses={401: {"description": "이메일 또는 비밀번호가 일치하지 않음"}, 503: {"description": "Supabase 인증 서비스 설정 또는 연결 문제"}},
+)
 def login(payload: LoginRequest):
     """이메일·비밀번호 조합을 인증하고 이후 API 호출에 쓸 Bearer 토큰을 반환한다."""
 
@@ -86,13 +93,12 @@ def login(payload: LoginRequest):
     )
 
 
-@router.post("/password-reset/demo", response_model=MessageResponse)
-def reset_password_for_classroom_demo(payload: DemoPasswordResetRequest):
+@router.post("/password-reset/demo", response_model=MessageResponse, summary="비밀번호 재설정")
+def reset_password(payload: PasswordResetRequest):
     """프로필 사용자 이름과 Auth 이메일이 일치할 때 비밀번호를 재설정한다.
 
-    보안: 이 코드는 학원 실습 프로젝트라는 요청에 따라 이메일 소유 인증을
-    의도적으로 생략한다. 배포 제품에 이 엔드포인트를 복사하지 말고 Supabase의
-    복구 이메일 흐름을 대신 사용해야 한다.
+    운영 환경에서는 이메일 소유 인증 또는 별도 본인 인증 절차를 함께 적용해야
+    한다. Supabase의 복구 이메일 흐름을 사용하는 방식을 권장한다.
     """
 
     try:
