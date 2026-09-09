@@ -24,6 +24,8 @@ from app.deps import CurrentUser, get_current_user
 router = APIRouter(prefix="/admin/dashboard", tags=["admin-dashboard"])
 KST = ZoneInfo("Asia/Seoul")
 MAX_PERIOD = timedelta(days=31)
+MAX_DASHBOARD_ROWS = 50_000
+DASHBOARD_PAGE_SIZE = 1_000
 LOG_COLUMNS = (
     "created_at,request_id,method,endpoint,status_code,latency_ms,error_type,"
     "user_id,trip_id,model"
@@ -81,15 +83,32 @@ def _period(start_at: datetime | None, end_at: datetime | None) -> DashboardPeri
 
 
 def _fetch_rows(client: Any, table_name: str, period: DashboardPeriod) -> list[dict[str, Any]]:
-    query = (
-        client.table(table_name)
-        .select(LOG_COLUMNS if table_name == "api_request_logs" else "created_at")
-        .gte("created_at", period.start_at.isoformat())
-        .lt("created_at", period.end_at.isoformat())
-        .range(0, 9999)
-    )
-    result = query.execute()
-    return list(result.data or [])
+    """조회 기간의 데이터를 최대 5만 행까지 페이지 단위로 읽는다.
+
+    Supabase 프로젝트의 최대 응답 행 수가 1,000으로 설정돼 있어도
+    페이지를 나눠 읽으면 전체 요청 수 KPI가 1,000행에서 잘리지 않는다.
+    대시보드 화면에서 필요한 최대 범위만 읽어 과도한 조회는 막는다.
+    """
+
+    rows: list[dict[str, Any]] = []
+    columns = LOG_COLUMNS if table_name == "api_request_logs" else "created_at"
+    for offset in range(0, MAX_DASHBOARD_ROWS, DASHBOARD_PAGE_SIZE):
+        end = min(offset + DASHBOARD_PAGE_SIZE - 1, MAX_DASHBOARD_ROWS - 1)
+        result = (
+            client.table(table_name)
+            .select(columns)
+            .gte("created_at", period.start_at.isoformat())
+            .lt("created_at", period.end_at.isoformat())
+            .range(offset, end)
+            .execute()
+        )
+        page = list(result.data or [])
+        if not page:
+            break
+        rows.extend(page)
+        if len(page) < DASHBOARD_PAGE_SIZE:
+            break
+    return rows[:MAX_DASHBOARD_ROWS]
 
 
 def _status_code(row: dict[str, Any]) -> int | None:
@@ -240,7 +259,7 @@ def _load_dashboard_data(period: DashboardPeriod) -> tuple[list[dict[str, Any]],
     return request_rows, len(signup_rows)
 
 
-@router.get("/summary", response_model=DashboardSummaryResponse, dependencies=[Depends(require_dashboard_admin)], summary="운영 대시보드 요약 조회")
+@router.get("/summary", response_model=DashboardSummaryResponse, dependencies=[Depends(require_dashboard_admin)])
 def dashboard_summary(
     start_at: datetime | None = Query(default=None),
     end_at: datetime | None = Query(default=None),
@@ -270,7 +289,7 @@ def dashboard_summary(
     )
 
 
-@router.get("/endpoints", response_model=list[EndpointUsageStat], dependencies=[Depends(require_dashboard_admin)], summary="API 엔드포인트 사용량 조회")
+@router.get("/endpoints", response_model=list[EndpointUsageStat], dependencies=[Depends(require_dashboard_admin)])
 def dashboard_endpoints(
     start_at: datetime | None = Query(default=None),
     end_at: datetime | None = Query(default=None),
@@ -283,7 +302,7 @@ def dashboard_endpoints(
     return _endpoint_stats(request_rows)
 
 
-@router.get("/errors", response_model=ErrorLogResponse, dependencies=[Depends(require_dashboard_admin)], summary="오류 요청 로그 조회")
+@router.get("/errors", response_model=ErrorLogResponse, dependencies=[Depends(require_dashboard_admin)])
 def dashboard_errors(
     start_at: datetime | None = Query(default=None),
     end_at: datetime | None = Query(default=None),
